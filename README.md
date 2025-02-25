@@ -1,5 +1,7 @@
 # Liang-Causality
- A repo for implementing causality matrix with the method of Liang's information flow
+ A repo for implementing causality matrix with the method of Liang's information flow.
+
+ ## EXAMPLE USAGE  
 
 Please kindly cite this repository and following papers if you find this repo is helpful in your project.  
     📑 X.San Liang, "[Normalized Multivariate Time Series Causality Analysis and Causal Graph Reconstruction](https://www.mdpi.com/1099-4300/23/6/679)", (2021)   
