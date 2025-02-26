@@ -144,10 +144,17 @@ if __name__ == '__main__':
     sigma = 0.01
 
     for i in range(t_eval.shape[0]):
-        tmp_y = -2*xy[i][1]*dt + xy[i][1]
-        xy[i+1][0] = (xy[i][1]+tmp_y)/2*dt + xy[i][0] + sigma*np.random.randn()
-        xy[i+1][1] = -2*(xy[i][1]+tmp_y)/2*dt + xy[i][1] + sigma*np.random.randn()
+        xy[i+1][0] = xy[i][1] * dt + xy[i][0] + sigma*np.random.randn()
+        xy[i+1][1] = -xy[i][1] * dt + xy[i][1] + sigma*np.random.randn()
     
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.plot(t_eval, xy[1:,0], label='x')
+    plt.plot(t_eval, xy[1:,1], label='y')
+    plt.xlabel('t')
+    plt.legend()
+    
+    #%%
     start_time = time.time()
     cau1, var1, cau1_normalized = causality_est_with_sig_norm(xy, n_step=1, dt=0.1)
     time_costs.append(time.time() - start_time)
@@ -226,31 +233,10 @@ if __name__ == '__main__':
     a15=0;   a25=0;   a35=0;     a45=0.2; a55=0.0;   a65=0.7; b5=0.8;
     a16=0;   a26=0;   a36=0;     a46=0;   a56=0.0;   a66=-0.5;b6=0.3;
     '''
-    xx=np.loadtxt('./case2_data.txt') # (100001, 6)
+    xx=np.loadtxt('./example_data/case2_data.txt') # (100001, 6)
 
     xx=xx[10000:].T # (100001, 6) -> (6, 90001)
-    from multi_causality_est import multi_causality_est
-    
-    start_time = time.time()
-    cau3=multi_causality_est(X=xx)#X [ndim,ntime_steps]
-    time_costs.append(time.time() - start_time)
 
-    #information flow from column to raw
-    IF = np.squeeze(cau3['IF']) 
-    #normalized information flow
-    nIF= np.squeeze(cau3.get('nIF'))
-    #significant test: confidence levels of 90/95/99% err_e90/err_e95/err_e99;
-    err= np.squeeze(cau3.get('err_e99')) 
-    #significant test (p-value)
-    p=np.squeeze(cau3.get('p'))
-
-    print('Causality matrix:')
-    print(nIF)
-    print('Significant test:')
-    print((np.abs(nIF)>err))
-    print('Time cost:', time_costs[-1])
-    
-    # print('-------------------\n')
     start_time = time.time()
     cau, var, cau_normalized = causality_est_with_sig_norm(xx.T, n_step=1, dt=1)
     time_costs.append(time.time() - start_time)
