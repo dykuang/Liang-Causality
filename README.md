@@ -17,7 +17,7 @@ cau, var, cau_normalized = causal_est_matrix(xy.T, n_step=1, dt=0.1)
 ```
 to obtain  
 * causality matrix `cau` whose $ij$'s entry indicates causality from $i$ to $j$ (the value can be positive and negative, positive values can be interpreted as "encouragement" effect while negative values can be interpreted as "surpression" effect),   
-* variance matrix for the estimation `var` whose $ij$'s entry is the variance for estimated causality value of $ij$'s entry in `cau` and normalized cuasality matrix `cau_normalized`.
+* variance matrix for the estimation `var` whose $ij$'s entry is the variance for estimated causality value of $ij$'s entry in `cau` and normalized causality matrix `cau_normalized`.
 
 Here `causal_est_matrix` is from `causality_estimation.py`, `n_step` gives the steps user specified for Euler finite difference scheme for estimation of derivatives in the internal algorithm. A further statistical test as below:
 ```
