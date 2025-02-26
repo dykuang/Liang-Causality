@@ -7,7 +7,7 @@
  ## EXAMPLE USAGE  
 
 ## Reference
-Please kindly cite this repository and following papers if you find this repo is helpful in your project.  
+Please kindly cite this repository and following papers if you find this repo helpful in your project.  
     📑 X.San Liang, "[Normalized Multivariate Time Series Causality Analysis and Causal Graph Reconstruction](https://www.mdpi.com/1099-4300/23/6/679)", (2021)   
     📑 X.San Liang, "[Information flow and causality as rigorous notions ab initio](https://journals.aps.org/pre/abstract/10.1103/PhysRevE.94.052201)",(2016)  
     📑 X.San Liang, "[Normalizing the causality between time series](https://journals.aps.org/pre/abstract/10.1103/PhysRevE.92.022126)",(2015)  
