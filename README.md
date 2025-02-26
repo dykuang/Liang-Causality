@@ -36,7 +36,7 @@ Why? Because the first equation indicates the dynamic of $x$ is internally drive
 False ($x\rightarrow x$), False ($x\rightarrow y$)  
 True ($y\rightarrow y$), True ($y\rightarrow x$)  
 
-As a simple summary for linear ODE as $\frac{dX}{dt} = AX + \epsilon$, if $A_{ij} \neq 0$, then you should expect the boolean type causality matrix $C^B$ with $C_{ji}^B$ equals `True`. Further, the float type causality matrix $C^F$'s $ji$'s th entry $C_{ji}^F$ should have the same sign as $A_{ij}$. You can check this with the above example where $A$ is 
+As a simple summary for linear ODE as $\frac{dX}{dt} = AX + \epsilon$, if $A_{ij} \neq 0$, then you should expect the boolean type causality matrix $C^B$ with $C_{ji}^B$ equals `True`. You can check this with the above example where $A$ is 
 ```
  0  1
  0 -1
