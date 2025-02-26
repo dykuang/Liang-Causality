@@ -1,4 +1,4 @@
-# Liang-Causality
+# Causality Inference via Liang-Kleeman information flow  
  A repo for implementing causality matrix with the method of Liang's information flow.
 
 * `causality_estimation.py` contains the implementation using `numpy`.    
