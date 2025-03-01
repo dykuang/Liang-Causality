@@ -63,12 +63,12 @@ causality,variance,normalized_causality = causal_est_matrix(XY)
 ```  
 or torch module `LiangCausalityEstimator` from the same file as:  
 ```
-XY = torch.tensor(xy.T, dtype=torch.float32)
+XY = torch.tensor(xy.T, dtype=torch.float32) 
 model = LiangCausalityEstimator(n_step=1, dt=1)
 XY = XY.unsqueeze(0)  # Add batch dimension
 causality, variance, normalized_causality = model(XY)
 ```
-They should provide the same result. Please find some more examples in `examples.ipynb`.
+They should provide the same result (`float32` works for most of the time, but `float64` may be needed for some cases). Please find some more examples in `example.ipynb`.
 
 
 ## Reference
