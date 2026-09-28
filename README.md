@@ -3,6 +3,78 @@
 
 * `causality_estimation.py` contains the implementation using `numpy`.    
 * `Causality_est_torch.py` contains the implementation using `torch`, where the method can be accessed via a regular function interface or as a torch module that can be directly integrated in neural networks' design as a layer.    
+* `amortized_lk.py` contains a label-free, permutation-equivariant LK approximation trained with matrix-free stochastic normal-equation residuals. It does not compute exact LK labels or solve the LK system.
+
+## Label-free amortized LK operator
+
+`AmortizedLK` predicts the regression coefficient matrix from each time-series window and combines it with a random-projection estimate of the covariance-ratio factor. Inputs have shape `(batch, variables, time)`; the module returns `(causal_matrix, coefficients, covariance_ratio)`.
+
+```python
+from amortized_lk import AmortizedLK, stochastic_probe_residual_loss
+
+model = AmortizedLK(width=32, projection_rank=64, n_step=1, dt=1.0)
+causal_hat, coefficients_hat, ratio_hat = model(windows)
+loss = stochastic_probe_residual_loss(
+    windows, coefficients_hat, q=4, n_step=1, dt=1.0
+)
+loss.backward()
+```
+
+The Rademacher probe loss is an unbiased estimate of the ridge normal-equation residual objective when `normalized=False` (the default). Pass a fixed temporal `projection` to `AmortizedLK.forward` to make the random-projection covariance-ratio estimate reproducible for a fixed window length. Exact LK may be used separately after training for evaluation, but it is not part of this training objective.
+
+For a no-teacher synthetic run, use `python train_amortized_lk.py --steps 1000 --output amortized_lk.pt`. Vary dimensions during training with `--variables-min 4 --variables-max 16 --time-min 128 --time-max 512`. Add `--h-method learned` to train the H2 covariance-ratio head from sampled variable pairs; otherwise H1 uses the temporal projection. Evaluate a saved checkpoint separately with `python evaluate_amortized_lk.py amortized_lk.pt`. Run the compact probe-count, probe-distribution, ridge, and H1-rank study with `python validate_amortized_lk.py`.
+
+### Selecting exact LK or the learned operator
+
+`LKEstimator` gives both paths one interface. The exact path returns the graph, variance, and normalized graph; the learned path returns the graph, coefficients, and covariance ratio (variance is not estimated).
+
+```python
+from lk_estimators import LKEstimator, load_amortized_checkpoint
+
+exact = LKEstimator(mode="exact", n_step=1, dt=1.0)
+exact_result = exact(windows)
+
+model = load_amortized_checkpoint("amortized_lk.pt")
+learned = LKEstimator(mode="amortized", amortized_model=model)
+learned_result = learned(windows)
+```
+
+The learned architecture is configurable with `encoder_type="tcn" | "downsample_mlp" | "spectral" | "attention"`, `decoder_type="pair_mlp" | "bilinear" | "low_rank" | "bilinear_residual"`, and `h_method="projection" | "learned" | "exact"`. H1 (`projection`) and H2 (`learned`) can be used in training. Exact H is an evaluation baseline; it skips the learned H head while retaining the learned coefficients. Call `.eval()` when using this H0 option. The trainer exposes encoder, decoder, H1/H2, loss, and probe choices as command-line flags; H0 is deliberately excluded from training.
+
+### CPU ablation
+
+Recreate the run with `python -m pip install -r requirements-amortized.txt` followed by `python benchmark_lk_ablations.py experiments/ablation_cpu.yaml`. The YAML file defines the data examples, model variants, training steps, and timing settings. Learned coefficient models train from probe residuals; H2 adds sampled covariance-ratio supervision. Exact LK is run after training to score the learned graphs. Full exact timing includes the legacy variance calculation, while `exact_graph_only` measures exact graph estimation without variance. Learned outputs include the graph, coefficients, and covariance ratio, but no variance estimate.
+
+Results below used PyTorch 2.11.0+cpu with one CPU thread, 150 training steps for each learned setting (80 for the p=32 case), batch size 8 (4 for p=32), and 20 timing repetitions. Inference milliseconds and training seconds are batch timings. These are small exploratory runs, not a speedup claim: this CPU and these dimensions generally favor exact LK, while training also has a nontrivial one-time cost. Graph MSE is against exact LK; rank correlation and sign accuracy are calculated across edges.
+
+| Example | Variant | Train (s) | Inference (ms) | Speedup | Graph MSE | Magnitude rank corr. | Strong sign acc. |
+|---|---|---:|---:|---:|---:|---:|---:|
+| small_oscillator_p2_t256 (p=2, T=256) | exact_lk | 0.00 | 0.931 | 1.00x | 0 | 1.0000 | 1.0000 |
+| small_oscillator_p2_t256 (p=2, T=256) | exact_graph_only | 0.00 | 0.292 | 3.19x | 4.967e-18 | 1.0000 | 1.0000 |
+| small_oscillator_p2_t256 (p=2, T=256) | tcn_pair_h1 | 2.51 | 1.709 | 0.54x | 0.00144123 | 0.5755 | 0.8125 |
+| small_oscillator_p2_t256 (p=2, T=256) | tcn_pair_h0_exact_H | 2.68 | 1.743 | 0.53x | 0.00144424 | 0.6745 | 0.8125 |
+| small_oscillator_p2_t256 (p=2, T=256) | tcn_pair_h2 | 2.38 | 1.623 | 0.57x | 0.00175193 | 0.2489 | 0.9375 |
+| small_oscillator_p2_t256 (p=2, T=256) | downsample_bilinear_h1 | 1.71 | 0.827 | 1.13x | 0.00125101 | 0.5946 | 0.9375 |
+| small_oscillator_p2_t256 (p=2, T=256) | spectral_lowrank_h1 | 1.75 | 0.769 | 1.21x | 0.00127972 | 0.3402 | 0.8750 |
+| small_oscillator_p2_t256 (p=2, T=256) | attention_bilinear_residual_h1 | 3.09 | 3.821 | 0.24x | 0.00188326 | 0.4326 | 0.6875 |
+| repository_6d_t512 (p=6, T=512) | exact_lk | 0.00 | 1.213 | 1.00x | 0 | 1.0000 | 1.0000 |
+| repository_6d_t512 (p=6, T=512) | exact_graph_only | 0.00 | 0.378 | 3.21x | 1.69478e-16 | 1.0000 | 1.0000 |
+| repository_6d_t512 (p=6, T=512) | tcn_pair_h1 | 4.74 | 4.020 | 0.30x | 0.102291 | 0.6258 | 0.6944 |
+| repository_6d_t512 (p=6, T=512) | tcn_pair_h0_exact_H | 4.61 | 5.060 | 0.24x | 0.0962113 | 0.7451 | 0.6597 |
+| repository_6d_t512 (p=6, T=512) | tcn_pair_h2 | 4.74 | 4.928 | 0.25x | 0.112704 | 0.4284 | 0.6528 |
+| repository_6d_t512 (p=6, T=512) | downsample_bilinear_h1 | 3.05 | 1.454 | 0.83x | 0.113624 | 0.5914 | 0.6875 |
+| repository_6d_t512 (p=6, T=512) | spectral_lowrank_h1 | 3.09 | 1.527 | 0.79x | 0.124962 | 0.5418 | 0.6875 |
+| repository_6d_t512 (p=6, T=512) | attention_bilinear_residual_h1 | 6.60 | 12.400 | 0.10x | 0.113767 | 0.5642 | 0.6528 |
+| sparse_var_p32_t512 (p=32, T=512) | exact_lk | 0.00 | 1.586 | 1.00x | 0 | 1.0000 | 1.0000 |
+| sparse_var_p32_t512 (p=32, T=512) | exact_graph_only | 0.00 | 0.705 | 2.25x | 4.40777e-17 | 1.0000 | 1.0000 |
+| sparse_var_p32_t512 (p=32, T=512) | tcn_pair_h1 | 3.91 | 12.019 | 0.13x | 0.0323748 | 0.2266 | 0.5269 |
+| sparse_var_p32_t512 (p=32, T=512) | tcn_pair_h0_exact_H | 4.30 | 12.926 | 0.12x | 0.0323741 | 0.7006 | 0.5244 |
+| sparse_var_p32_t512 (p=32, T=512) | tcn_pair_h2 | 4.23 | 12.474 | 0.13x | 0.0343556 | -0.0757 | 0.5137 |
+| sparse_var_p32_t512 (p=32, T=512) | downsample_bilinear_h1 | 1.52 | 1.703 | 0.93x | 0.0323034 | 0.2202 | 0.5269 |
+| sparse_var_p32_t512 (p=32, T=512) | spectral_lowrank_h1 | 1.63 | 1.691 | 0.94x | 0.0319889 | 0.2241 | 0.5269 |
+| sparse_var_p32_t512 (p=32, T=512) | attention_bilinear_residual_h1 | 6.36 | 26.906 | 0.06x | 0.0346577 | 0.1384 | 0.4878 |
+
+The machine-readable results and copied run config are in `experiments/results/cpu_ablation/`.
 
  ## EXAMPLE USAGE  
 Suppose we have observed two time series as:  
