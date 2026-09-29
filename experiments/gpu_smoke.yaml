@@ -1,0 +1,18 @@
+runtime:
+  device: cuda
+  dtype: float32
+  compile: false
+  compile_mode: reduce-overhead
+  warmup_repeats: 5
+  timing_repeats: 10
+  synchronize_cuda: true
+seed: 20260928
+output_dir: experiments/results/gpu_smoke
+training: {steps: 20, batch_size: 8, learning_rate: 0.002, probes: 4, ridge_scale: 0.001, loss_mode: plain, probe_distribution: rademacher, h_pairs: 32, h_weight: 1.0, width: 16, low_rank: 8, h_rank: 4, compute_graph: false}
+examples:
+  - {name: stable_var_p32_t256, generator: stable_var, variables: 32, time: 256, eval_examples: 8, edge_probability: 0.08}
+variants:
+  - {name: exact_graph_only, mode: exact_graph}
+  - {name: downsample_lowrank_exact_h, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 8, h_method: exact}
+  - {name: downsample_lowrank_h1_r16, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 8, h_method: projection, projection_rank: 16}
+  - {name: downsample_lowrank_learned_h_r4, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 8, h_method: learned_low_rank, h_rank: 4, h_structure: correlation_psd}

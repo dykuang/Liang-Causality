@@ -16,30 +16,51 @@ try:
 except ImportError as exc:
     raise SystemExit("PyYAML is required; install with `pip install pyyaml`.") from exc
 
-from amortized_lk import AmortizedLK, sampled_covariance_ratio_loss, stochastic_probe_residual_loss
+from amortized_lk import (
+    AmortizedLK, sampled_covariance_ratio_loss, sampled_covariance_ratio_pair_loss,
+    stochastic_probe_residual_loss, exact_covariance_ratio,
+)
 from evaluate_amortized_lk import exact_lk_graph
 from lk_estimators import LKEstimator
 from train_amortized_lk import stable_var_batch
 
 
-def _median_seconds(fn, repeats: int, device: torch.device) -> float:
+def _timing(fn, repeats: int, warmup: int, device: torch.device) -> tuple[float, float]:
+    """Return CUDA-event (or wall) and synchronized wall seconds."""
     with torch.no_grad():
-        for _ in range(3):
+        for _ in range(warmup):
             fn()
         if device.type == "cuda":
             torch.cuda.synchronize(device)
+            event_times, wall_times = [], []
+            for _ in range(repeats):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                wall_start = time.perf_counter()
+                start.record(); fn(); end.record(); end.synchronize()
+                event_times.append(start.elapsed_time(end) / 1000)
+                wall_times.append(time.perf_counter() - wall_start)
+            return statistics.median(event_times), statistics.median(wall_times)
         times = []
         for _ in range(repeats):
-            start = time.perf_counter()
-            fn()
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            times.append(time.perf_counter() - start)
-    return statistics.median(times)
+            start = time.perf_counter(); fn(); times.append(time.perf_counter() - start)
+    return statistics.median(times), statistics.median(times)
+
+
+def _exact_graph_solve_ex(x: torch.Tensor, n_step: int = 1, dt: float = 1.0) -> torch.Tensor:
+    z = x[..., :-n_step]
+    y = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
+    z, y = z - z.mean(-1, keepdim=True), y - y.mean(-1, keepdim=True)
+    denom = z.shape[-1] - 1
+    c, d = z @ z.transpose(1, 2) / denom, z @ y.transpose(1, 2) / denom
+    w, info = torch.linalg.solve_ex(c, d, check_errors=False)
+    if torch.any(info != 0):
+        w = torch.linalg.solve(c, d)
+    h = c / torch.diagonal(c, dim1=-2, dim2=-1).unsqueeze(-2).clamp_min(torch.finfo(x.dtype).eps)
+    return h * w
 
 
 def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:
-    a, b = a.flatten(), b.flatten()
+    a, b = a.float().flatten(), b.float().flatten()
     ra = torch.argsort(torch.argsort(a)).to(a.dtype)
     rb = torch.argsort(torch.argsort(b)).to(b.dtype)
     ra, rb = ra - ra.mean(), rb - rb.mean()
@@ -47,6 +68,7 @@ def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:
 
 
 def _metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    prediction, target = prediction.float(), target.float()
     error = prediction - target
     edge_abs = target.abs()
     strong = edge_abs >= edge_abs.quantile(0.5)
@@ -73,13 +95,14 @@ def _example_batch(
     *,
     device: torch.device,
     generator: torch.Generator,
+    dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """Build one example family without computing any LK targets."""
     kind = example.get("generator", "stable_var")
     p, length = int(example["variables"]), int(example["time"])
     if kind == "stable_var":
         return stable_var_batch(
-            batch, p, length, device=device, dtype=torch.float32,
+            batch, p, length, device=device, dtype=dtype,
             generator=generator,
             edge_probability=float(example.get("edge_probability", 0.2)),
         )
@@ -87,7 +110,7 @@ def _example_batch(
         if p != 2:
             raise ValueError("oscillator examples require exactly 2 variables")
         transition = torch.tensor(
-            [[0.98, 0.08], [-0.12, 0.94]], device=device, dtype=torch.float32
+            [[0.98, 0.08], [-0.12, 0.94]], device=device, dtype=dtype
         )
     elif kind == "repository6d":
         if p != 6:
@@ -120,22 +143,23 @@ def _train_variant(
     seed: int,
     data_seed: int,
 ) -> tuple[AmortizedLK, float]:
-    device = torch.device(settings["device"])
+    device = torch.device(settings["runtime"]["device"])
+    dtype = settings["dtype"]
     torch.manual_seed(seed)
     model = AmortizedLK(
         width=variant.get("width", settings["training"]["width"]),
         projection_rank=variant.get("projection_rank", settings.get("projection_rank", 64)),
         n_step=example.get("n_step", 1),
         dt=example.get("dt", 1.0),
-        h_method=(
-            "projection" if variant.get("h_method", "projection") == "exact"
-            else variant.get("h_method", "projection")
-        ),
+        h_method=variant.get("h_method", "projection"),
         encoder_type=variant.get("encoder_type", "tcn"),
         decoder_type=variant.get("decoder_type", "pair_mlp"),
         use_global_context=variant.get("use_global_context", True),
         low_rank=variant.get("low_rank", settings["training"].get("low_rank", 16)),
-    ).to(device)
+        h_rank=variant.get("h_rank", settings["training"].get("h_rank", 8)),
+        h_factor_hidden=variant.get("h_factor_hidden"),
+        h_structure=variant.get("h_structure", "correlation_psd"),
+    ).to(device=device, dtype=dtype)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=variant.get("learning_rate", settings["training"]["learning_rate"])
     )
@@ -148,9 +172,9 @@ def _train_variant(
             example,
             example.get("training_batch_size", training["batch_size"]),
             device=device,
-            generator=data_generator,
+            generator=data_generator, dtype=dtype,
         )
-        _, w_hat, h_hat = model(x, generator=probe_generator)
+        _, w_hat, _ = model(x, generator=probe_generator, compute_graph=False)
         loss = stochastic_probe_residual_loss(
             x,
             w_hat,
@@ -162,165 +186,110 @@ def _train_variant(
             dt=example.get("dt", 1.0),
             generator=probe_generator,
         )
-        if variant.get("h_method", "projection") == "learned":
+        if model.h_method in {"learned_pair", "learned_low_rank"}:
             pairs = torch.randint(
                 example["variables"],
                 (training["h_pairs"], 2),
                 device=device,
                 generator=probe_generator,
             )
-            loss = loss + training["h_weight"] * sampled_covariance_ratio_loss(
-                x,
-                h_hat,
-                pairs,
-                n_step=example.get("n_step", 1),
-                dt=example.get("dt", 1.0),
-            )
+            if model.h_method == "learned_low_rank":
+                pair_predictions = model.score_h_pairs(x, pairs)
+                h_loss = sampled_covariance_ratio_pair_loss(x, pair_predictions, pairs, n_step=example.get("n_step", 1), dt=example.get("dt", 1.0))
+            else:
+                _, _, h_hat = model(x, generator=probe_generator)
+                h_loss = sampled_covariance_ratio_loss(x, h_hat, pairs, n_step=example.get("n_step", 1), dt=example.get("dt", 1.0))
+            loss = loss + training["h_weight"] * h_loss
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-    if variant.get("h_method") == "exact":
-        # H0 is evaluation-only; the coefficient model was optimized using the
-        # same label-free residual as the H1/H2 variants.
-        model.h_method = "exact"
     return model.eval(), time.perf_counter() - start
+
+
+def _validate(config: dict) -> dict:
+    runtime = dict(config.get("runtime", {}))
+    runtime.setdefault("device", config.get("device", "cpu"))
+    runtime.setdefault("dtype", "float32")
+    runtime.setdefault("compile", False)
+    runtime.setdefault("compile_mode", "reduce-overhead")
+    runtime.setdefault("warmup_repeats", 3 if runtime["device"] == "cpu" else 10)
+    runtime.setdefault("timing_repeats", config.get("timing_repeats", 20))
+    runtime.setdefault("synchronize_cuda", True)
+    if runtime["dtype"] not in {"float32", "bfloat16", "float16"}:
+        raise ValueError("runtime.dtype must be float32, bfloat16, or float16")
+    if runtime["device"] == "cpu" and runtime["dtype"] != "float32":
+        raise ValueError("mixed precision is supported only on CUDA")
+    if runtime["compile"] and not hasattr(torch, "compile"):
+        raise RuntimeError("runtime.compile=true but torch.compile is unavailable")
+    config["runtime"] = runtime
+    config["dtype"] = getattr(torch, runtime["dtype"])
+    for variant in config["variants"]:
+        if variant.get("h_method") == "projection" and int(variant.get("projection_rank", config.get("projection_rank", 64))) < 1:
+            raise ValueError("projection_rank must be positive")
+        if variant.get("h_method") == "learned_low_rank" and int(variant.get("h_rank", config["training"].get("h_rank", 8))) < 1:
+            raise ValueError("h_rank must be positive")
+        if variant.get("decoder_type") == "low_rank" and int(variant.get("low_rank", config["training"].get("low_rank", 16))) < 1:
+            raise ValueError("low_rank must be positive")
+    return config
 
 
 def run(config_path: Path) -> tuple[Path, Path]:
     config_path = config_path.resolve()
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-    device = torch.device(config.get("device", "cpu"))
-    if device.type == "cpu":
-        torch.set_num_threads(int(config.get("num_threads", 1)))
+    config = _validate(yaml.safe_load(config_path.read_text(encoding="utf-8")))
+    runtime, dtype = config["runtime"], config["dtype"]
+    device = torch.device(runtime["device"])
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA requested but unavailable")
+    if device.type == "cpu": torch.set_num_threads(int(config.get("num_threads", 1)))
     output_dir = Path(config.get("output_dir", "results/ablations"))
-    if not output_dir.is_absolute():
-        output_dir = Path.cwd() / output_dir
-    output_dir = output_dir.resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(config_path, output_dir / "config.yaml")
-    rows: list[dict] = []
-    base_seed = int(config.get("seed", 0))
-
+    output_dir = (Path.cwd() / output_dir if not output_dir.is_absolute() else output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True); shutil.copyfile(config_path, output_dir / "config.yaml")
+    rows, base_seed = [], int(config.get("seed", 0))
     for example_index, example in enumerate(config["examples"]):
-        example_seed = base_seed + example_index * 100_000
-        eval_generator = torch.Generator(device=device).manual_seed(example_seed + 7)
-        evaluation = _example_batch(
-            example,
-            int(example.get("eval_examples", 8)),
-            device=device,
-            generator=eval_generator,
-        )
-        projection_generator = torch.Generator(device=device).manual_seed(example_seed + 9)
-        projection_rank = int(config.get("projection_rank", 64))
-        projection = torch.randn(
-            projection_rank,
-            example["time"] - int(example.get("n_step", 1)),
-            device=device,
-            generator=projection_generator,
-        ) / projection_rank**0.5
-
+        seed = base_seed + example_index * 100_000
+        evaluation = _example_batch(example, int(example.get("eval_examples", 8)), device=device, generator=torch.Generator(device=device).manual_seed(seed + 7), dtype=dtype)
         fitted = []
-        for variant_index, variant in enumerate(config["variants"]):
-            if variant.get("mode") in {"exact", "exact_graph"}:
-                fitted.append((variant, None, 0.0))
-            elif variant.get("mode") == "amortized":
-                model, train_seconds = _train_variant(
-                    variant,
-                    config,
-                    example,
-                    seed=example_seed + variant_index * 1000,
-                    data_seed=example_seed,
-                )
-                fitted.append((variant, model, train_seconds))
-            else:
-                raise ValueError(f"unknown mode in variant {variant['name']!r}")
-            print(f"prepared {example['name']} / {variant['name']}")
-
-        # Exact LK is evaluated only after all learned variants have finished training.
-        exact_estimator = LKEstimator(
-            mode="exact",
-            n_step=int(example.get("n_step", 1)),
-            dt=float(example.get("dt", 1.0)),
-        ).to(device).eval()
+        for index, variant in enumerate(config["variants"]):
+            if variant.get("mode") in {"exact", "exact_graph", "exact_graph_solve_ex"}: fitted.append((variant, None, 0.0))
+            elif variant.get("mode") == "amortized": fitted.append((variant, *_train_variant(variant, config, example, seed=seed + index * 1000, data_seed=seed)))
+            else: raise ValueError(f"unknown mode {variant.get('mode')!r}")
+        n_step, dt = int(example.get("n_step", 1)), float(example.get("dt", 1.0))
+        exact_estimator = LKEstimator(mode="exact", n_step=n_step, dt=dt).to(device=device, dtype=torch.float32).eval()
+        exact_input = evaluation.float() if dtype != torch.float32 else evaluation
         with torch.no_grad():
-            reference = exact_estimator(evaluation).graph
-            graph_only_reference = exact_lk_graph(
-                evaluation,
-                n_step=int(example.get("n_step", 1)),
-                dt=float(example.get("dt", 1.0)),
-            )[0]
-        exact_seconds = _median_seconds(
-            lambda: exact_estimator(evaluation), int(config.get("timing_repeats", 20)), device
-        )
-        graph_only_seconds = _median_seconds(
-            lambda: exact_lk_graph(
-                evaluation,
-                n_step=int(example.get("n_step", 1)),
-                dt=float(example.get("dt", 1.0)),
-            ),
-            int(config.get("timing_repeats", 20)), device,
-        )
-
+            reference = exact_estimator(exact_input).graph.to(dtype)
+            graph_reference = exact_lk_graph(exact_input, n_step=n_step, dt=dt)[0].to(dtype)
+            h_reference = exact_covariance_ratio(evaluation, n_step=n_step, dt=dt)
+        exact_time = _timing(lambda: exact_estimator(exact_input), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
+        graph_time = _timing(lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
         for variant, model, train_seconds in fitted:
-            if variant.get("mode") == "exact":
-                prediction = reference
-                inference_seconds = exact_seconds
-            elif variant.get("mode") == "exact_graph":
-                prediction = graph_only_reference
-                inference_seconds = graph_only_seconds
+            peak = 0.0
+            if variant["mode"] == "exact": prediction, h_hat, timer = reference, h_reference, lambda: exact_estimator(exact_input)
+            elif variant["mode"] == "exact_graph": prediction, h_hat, timer = graph_reference, h_reference, lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt)
+            elif variant["mode"] == "exact_graph_solve_ex": prediction, h_hat, timer = _exact_graph_solve_ex(exact_input, n_step, dt).to(dtype), h_reference, lambda: _exact_graph_solve_ex(exact_input, n_step, dt)
             else:
                 assert model is not None
-                fixed_projection = projection if variant.get("h_method", "projection") == "projection" else None
-                estimator = LKEstimator(
-                    mode="amortized", amortized_model=model
-                ).to(device).eval()
-                with torch.no_grad():
-                    prediction = estimator(evaluation, projection=fixed_projection).graph
-                inference_seconds = _median_seconds(
-                    lambda: estimator(evaluation, projection=fixed_projection),
-                    int(config.get("timing_repeats", 20)), device,
-                )
+                projection = None
+                if model.h_method == "projection":
+                    rank = model.projection_rank
+                    projection = torch.randn(rank, example["time"] - n_step, device=device, dtype=dtype, generator=torch.Generator(device=device).manual_seed(seed + 9)) / rank**0.5
+                estimator = LKEstimator(mode="amortized", amortized_model=model).to(device).eval()
+                if runtime["compile"]: estimator = torch.compile(estimator, mode=runtime["compile_mode"])
+                with torch.no_grad(): prediction, _, h_hat = model(evaluation, projection=projection)
+                timer = lambda: estimator(evaluation, projection=projection)
+            if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
+            inference, wall = _timing(timer, runtime["timing_repeats"], runtime["warmup_repeats"], device)
+            if device.type == "cuda": peak = torch.cuda.max_memory_allocated(device) / 2**20
             metrics = _metrics(prediction, reference)
-            row = {
-                "example": example["name"],
-                "variables": example["variables"],
-                "time": example["time"],
-                "variant": variant["name"],
-                "mode": variant["mode"],
-                "train_seconds": train_seconds,
-                "inference_seconds": inference_seconds,
-                "speedup_vs_exact": exact_seconds / max(inference_seconds, 1e-12),
-                **metrics,
-            }
-            rows.append(row)
-            print(
-                f"measured {row['example']} / {row['variant']}: "
-                f"{row['inference_seconds']:.6g}s, mse={row['graph_mse']:.6g}"
-            )
-
+            h_metrics = _metrics(h_hat, h_reference) if h_hat is not None else {"graph_mse": float("nan"), "magnitude_rank_corr": float("nan")}
+            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), "requested_dtype": runtime["dtype"], "effective_dtype": "float32" if variant["mode"].startswith("exact") else runtime["dtype"], "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["graph_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
+            rows.append(row); print(f"measured {row['example']} / {row['variant']}: {row['inference_ms']:.3f}ms")
     csv_path = output_dir / "results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-        writer.writeheader()
-        writer.writerows(rows)
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     markdown_path = output_dir / "results.md"
-    lines = [
-        "# CPU LK ablation results",
-        "",
-        f"Config: `config.yaml`; PyTorch {torch.__version__}; device `{device}`.",
-        "The `exact_lk` timer includes the repository's variance calculation; `exact_graph_only` isolates graph estimation. Learned timing reports graph inference and does not produce variance.",
-        "",
-        "| Example | Variant | Train (s) | Inference (ms) | Speedup | Graph MSE | Magnitude rank corr. | Strong sign acc. |",
-        "|---|---|---:|---:|---:|---:|---:|---:|",
-    ]
-    for row in rows:
-        lines.append(
-            f"| {row['example']} (p={row['variables']}, T={row['time']}) "
-            f"| {row['variant']} | {row['train_seconds']:.2f} "
-            f"| {1000*row['inference_seconds']:.3f} "
-            f"| {row['speedup_vs_exact']:.2f}x | {row['graph_mse']:.6g} "
-            f"| {row['magnitude_rank_corr']:.4f} | {row['strong_sign_accuracy']:.4f} |"
-        )
+    lines = ["# LK benchmark results", "", f"Device `{device}`, requested dtype `{runtime['dtype']}`.", "", "| Example | Variant | Inference (ms) | Speedup vs graph-only exact | Graph rank corr. | H MSE | Peak MB |", "|---|---|---:|---:|---:|---:|---:|"]
+    lines += [f"| {r['example']} | {r['variant']} | {r['inference_ms']:.3f} | {r['speedup_vs_exact_graph_only']:.2f}x | {r['magnitude_rank_corr']:.4f} | {r['h_mse']:.5g} | {r['peak_memory_mb']:.1f} |" for r in rows]
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, markdown_path
 

@@ -8,6 +8,7 @@ from amortized_lk import (
     exact_covariance_ratio,
     random_projection_covariance_ratio,
     sampled_covariance_ratio_loss,
+    sampled_covariance_ratio_pair_loss,
     stochastic_probe_residual_loss,
 )
 from lk_estimators import LKEstimator
@@ -112,6 +113,51 @@ class AmortizedLKTests(unittest.TestCase):
         loss.backward()
         self.assertTrue(torch.isfinite(loss))
         self.assertIsNotNone(model.h_decoder[0].weight.grad)
+
+    def test_exact_h_is_trainable_and_never_solves(self):
+        model = AmortizedLK(width=8, h_method="exact").double().train()
+        with patch("torch.linalg.solve", side_effect=AssertionError("exact solve called")), patch("torch.linalg.pinv", side_effect=AssertionError("pinv called")):
+            graph, _, h_hat = model(self.x)
+        self.assertTrue(torch.allclose(h_hat, exact_covariance_ratio(self.x), atol=1e-12, rtol=1e-12))
+        self.assertTrue(torch.isfinite(graph).all())
+
+    def test_low_rank_h_structure_pair_scoring_and_gradients(self):
+        model = AmortizedLK(width=8, h_method="learned_low_rank", h_rank=3).double()
+        graph, _, h_hat = model(self.x)
+        self.assertEqual(tuple(h_hat.shape), (3, 4, 4))
+        rho = h_hat * torch.ones_like(h_hat)  # Recover rho with the known channel scales below.
+        centered = self.x - self.x.mean(-1, keepdim=True)
+        scales = centered.square().mean(-1).sqrt()
+        anchor = centered.gather(-1, centered.abs().argmax(dim=-1, keepdim=True)).squeeze(-1)
+        signed_scales = scales * torch.where(anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor))
+        rho = h_hat * signed_scales.unsqueeze(-2) / signed_scales.unsqueeze(-1)
+        self.assertTrue(torch.allclose(rho, rho.transpose(-1, -2), atol=1e-10, rtol=1e-10))
+        self.assertTrue(torch.allclose(torch.diagonal(rho, dim1=-2, dim2=-1), torch.ones(3, 4, dtype=self.x.dtype), atol=1e-10))
+        pairs = torch.tensor([[0, 1], [2, 3], [1, 1]])
+        selected = model.score_h_pairs(self.x, pairs)
+        self.assertTrue(torch.allclose(selected, h_hat[:, pairs[:, 0], pairs[:, 1]], atol=1e-10, rtol=1e-10))
+        loss = sampled_covariance_ratio_pair_loss(self.x, selected, pairs)
+        loss.backward()
+        self.assertGreater(float(model.low_rank_h_head.network[0].weight.grad.norm()), 0.0)
+
+    def test_exact_and_low_rank_h_preserve_scaling_and_permutation(self):
+        scales = torch.tensor([0.02, -0.4, 3.0, 20.0], dtype=self.x.dtype)
+        permutation = torch.tensor([2, 0, 3, 1])
+        for method in ("exact", "learned_low_rank"):
+            model = AmortizedLK(width=8, h_method=method, h_rank=3).double().eval()
+            with torch.no_grad():
+                base = model(self.x)[0]
+                scaled = model(self.x * scales[None, :, None])[0]
+                permuted = model(self.x[:, permutation])[0]
+            self.assertTrue(torch.allclose(base, scaled, atol=1e-10, rtol=1e-10), method)
+            self.assertTrue(torch.allclose(base[:, permutation][:, :, permutation], permuted, atol=1e-10, rtol=1e-10), method)
+
+    def test_coefficient_only_forward(self):
+        model = AmortizedLK(width=8, h_method="exact").double()
+        graph, w_hat, h_hat = model(self.x, compute_graph=False)
+        self.assertIsNone(graph)
+        self.assertIsNone(h_hat)
+        self.assertEqual(tuple(w_hat.shape), (3, 4, 4))
 
     def test_estimator_selector_and_architecture_variants(self):
         exact = LKEstimator(mode="exact")(self.x.float())

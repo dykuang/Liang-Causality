@@ -39,7 +39,7 @@ learned = LKEstimator(mode="amortized", amortized_model=model)
 learned_result = learned(windows)
 ```
 
-The learned architecture is configurable with `encoder_type="tcn" | "downsample_mlp" | "spectral" | "attention"`, `decoder_type="pair_mlp" | "bilinear" | "low_rank" | "bilinear_residual"`, and `h_method="projection" | "learned" | "exact"`. H1 (`projection`) and H2 (`learned`) can be used in training. Exact H is an evaluation baseline; it skips the learned H head while retaining the learned coefficients. Call `.eval()` when using this H0 option. The trainer exposes encoder, decoder, H1/H2, loss, and probe choices as command-line flags; H0 is deliberately excluded from training.
+The learned architecture is configurable with `encoder_type="tcn" | "downsample_mlp" | "spectral" | "attention"`, `decoder_type="pair_mlp" | "bilinear" | "low_rank" | "bilinear_residual"`, and `h_method="projection" | "learned_pair" | "learned_low_rank" | "exact"` (`learned` remains an alias for `learned_pair`). Exact H is a regular label-free mode: it computes the covariance-ratio factor but never an LK coefficient solve. Use `compute_graph=False` when coefficient-residual training does not need a graph.
 
 ### CPU ablation
 
@@ -75,6 +75,53 @@ Results below used PyTorch 2.11.0+cpu with one CPU thread, 150 training steps fo
 | sparse_var_p32_t512 (p=32, T=512) | attention_bilinear_residual_h1 | 6.36 | 26.906 | 0.06x | 0.0346577 | 0.1384 | 0.4878 |
 
 The machine-readable results and copied run config are in `experiments/results/cpu_ablation/`.
+
+### GPU H variants and crossover benchmarks
+
+`AmortizedLK` also supports `h_method="exact"` during training (it computes only the covariance ratio, not an LK solve), `h_method="learned_pair"` (the compatibility name for `learned`), and `h_method="learned_low_rank"`. The latter constructs a symmetric PSD low-rank correlation matrix and combines it with exact per-channel RMS ratios. Set `compute_graph=False` to train coefficients without materializing H or the graph; `score_h_pairs()` supports sampled low-rank-H supervision without a dense H allocation.
+
+GPU suites remain YAML-driven and are run through the same entry point:
+
+- `env -u LD_LIBRARY_PATH python benchmark_lk_ablations.py experiments/gpu_smoke.yaml`
+- `env -u LD_LIBRARY_PATH python benchmark_lk_ablations.py experiments/gpu_crossover.yaml`
+- `env -u LD_LIBRARY_PATH python benchmark_lk_ablations.py experiments/gpu_h_variants.yaml`
+- `env -u LD_LIBRARY_PATH python benchmark_lk_ablations.py experiments/gpu_precision_compile.yaml`
+
+Each output includes the copied configuration, machine-readable CSV, and Markdown summary. CUDA runs use warmup iterations, CUDA-event latency, synchronized wall latency, peak allocated memory, requested/effective dtype, compile metadata, H-isolation metrics, and speedup against graph-only exact LK. The `env -u LD_LIBRARY_PATH` prefix is needed on this machine because its CUDA 11.2 system library path conflicts with PyTorch's bundled CUDA 11.7 libraries; it is not normally necessary.
+
+## GPU benchmark results
+
+Benchmarks were run on an NVIDIA GeForce RTX 3080 Ti (12 GB), PyTorch 1.13.1+cu117, with CUDA-event latency after warmup. All amortized models used the downsampled-MLP encoder, a rank-16 coefficient decoder, label-free probe-residual training, and batch size 32. The exact baseline is graph-only exact LK; it is the relevant comparison because amortized inference does not return exact-LK variance.
+
+### FP32 crossover: T=512
+
+| Variables | Exact graph-only (ms) | Exact-H learned-W (ms / speedup / rank corr.) | Low-rank-H r=8 (ms / speedup / rank corr.) |
+|---:|---:|---:|---:|
+| 32 | 0.347 | 0.295 / 1.18x / 0.5628 | 0.312 / 1.12x / 0.1099 |
+| 64 | 0.677 | 0.337 / 2.01x / 0.5158 | 0.301 / 2.25x / 0.0700 |
+| 128 | 1.299 | 0.511 / 2.54x / 0.4887 | 0.393 / 3.30x / 0.0339 |
+| 256 | 3.126 | 1.001 / 3.13x / 0.4819 | 0.843 / 3.72x / 0.0206 |
+
+Exact-H provides the useful fidelity/speed trade-off in this initial sweep: it reaches 2--3x graph-only-exact speedup for p >= 64 while retaining roughly 0.48--0.56 graph magnitude-rank correlation. Low-rank H is faster and uses less peak memory, but its final graph rank correlation is currently poor; it should be treated as a speed/memory ablation, not the default fidelity option.
+
+### H-head isolation: FP32, p=128, T=512
+
+| H method | Latency (ms) | Speedup | H MSE | Graph rank corr. | Peak memory (MB) |
+|---|---:|---:|---:|---:|---:|
+| Exact H | 0.512 | 2.57x | 0 | 0.4874 | 55.1 |
+| Projection H (r=32) | 0.481 | 2.73x | 0.0333 | 0.0440 | 55.2 |
+| Learned pair H | 3.423 | 0.38x | 0.00945 | 0.0314 | 607.2 |
+| Learned low-rank H (r=8) | 0.397 | 3.31x | 0.1265 | 0.0313 | 39.7 |
+
+### BF16 eager: p=128, T=512
+
+| Variant | Latency (ms) | Speedup | Graph rank corr. | Peak memory (MB) |
+|---|---:|---:|---:|---:|
+| Exact graph-only (FP32 effective) | 1.295 | 1.00x | 1.0000 | 61.1 |
+| Exact-H learned-W | 0.333 | 3.88x | 0.4906 | 35.3 |
+| Learned low-rank H (r=8) | 0.313 | 4.13x | 0.0279 | 28.1 |
+
+Raw CSV/Markdown outputs and copied configurations are in `experiments/results/gpu_crossover/`, `experiments/results/gpu_h_variants/`, `experiments/results/gpu_precision_eager/`, and `experiments/results/gpu_smoke/`. The `gpu_precision_compile.yaml` suite fails early and explicitly on this host because PyTorch 1.13.1 does not provide `torch.compile`; eager BF16 is reported above instead.
 
  ## EXAMPLE USAGE  
 Suppose we have observed two time series as:  

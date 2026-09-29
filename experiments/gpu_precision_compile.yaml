@@ -1,0 +1,9 @@
+runtime: {device: cuda, dtype: bfloat16, compile: true, compile_mode: reduce-overhead, warmup_repeats: 10, timing_repeats: 50, synchronize_cuda: true}
+seed: 20260928
+output_dir: experiments/results/gpu_precision_compile
+training: {steps: 200, batch_size: 32, learning_rate: 0.002, probes: 4, ridge_scale: 0.001, loss_mode: plain, probe_distribution: rademacher, h_pairs: 128, h_weight: 1.0, width: 32, low_rank: 16, h_rank: 8, compute_graph: false}
+examples: [{name: sparse_var_p128_t512, generator: stable_var, variables: 128, time: 512, eval_examples: 32, edge_probability: 0.05}]
+variants:
+  - {name: exact_graph_only, mode: exact_graph}
+  - {name: exact_h_lrW16, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: exact}
+  - {name: lr_h8_lrW16, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_low_rank, h_rank: 8}

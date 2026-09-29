@@ -193,6 +193,26 @@ def sampled_covariance_ratio_loss(
     return (prediction - target).square().mean()
 
 
+def sampled_covariance_ratio_pair_loss(
+    x: Tensor, h_pairs: Tensor, pairs: Tensor, *, n_step: int = 1,
+    dt: float = 1.0, eps: Optional[float] = None,
+) -> Tensor:
+    """Supervise selected covariance ratios without materializing full H."""
+    z, _ = _state_and_derivative(x, n_step, dt)
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        raise ValueError("pairs must have shape [num_pairs, 2]")
+    if h_pairs.shape != (z.shape[0], pairs.shape[0]):
+        raise ValueError("h_pairs must have shape [batch, num_pairs]")
+    pairs = pairs.to(device=x.device, dtype=torch.long)
+    i, j = pairs.unbind(dim=1)
+    numerator = (z[:, i] * z[:, j]).sum(dim=-1)
+    denominator = z[:, j].square().sum(dim=-1)
+    if eps is None:
+        eps = torch.finfo(x.dtype).eps
+    target = numerator / denominator.clamp_min(eps)
+    return (h_pairs - target).square().mean()
+
+
 class SharedTemporalEncoder(nn.Module):
     """Three-layer temporal CNN applied independently to each variable."""
 
@@ -315,6 +335,41 @@ class LowRankEdgeDecoder(nn.Module):
         return source @ target.transpose(1, 2) / math.sqrt(source.shape[-1])
 
 
+class LowRankCorrelationHead(nn.Module):
+    """PSD low-rank correlation head with cheap selected-pair scoring."""
+
+    def __init__(self, width: int, rank: int, hidden: Optional[int] = None):
+        super().__init__()
+        hidden = hidden or width
+        self.network = nn.Sequential(
+            nn.Linear(2 * width, hidden), nn.GELU(), nn.Linear(hidden, rank)
+        )
+
+    def factors(self, h: Tensor, global_context: Tensor) -> Tensor:
+        context = global_context[:, None, :].expand(-1, h.shape[1], -1)
+        return self.network(torch.cat((h, context), dim=-1))
+
+    @staticmethod
+    def score_pairs(factors: Tensor, scales: Tensor, pairs: Tensor, eps: float) -> Tensor:
+        pairs = pairs.to(device=factors.device, dtype=torch.long)
+        i, j = pairs.unbind(dim=1)
+        u_i, u_j = factors[:, i], factors[:, j]
+        rho = (u_i * u_j).sum(dim=-1)
+        rho = rho / (u_i.square().sum(dim=-1) * u_j.square().sum(dim=-1)).sqrt().clamp_min(eps)
+        denominator = scales[:, j]
+        denominator = torch.where(denominator.abs() < eps, denominator.new_full((), eps), denominator)
+        return rho * scales[:, i] / denominator
+
+    @staticmethod
+    def materialize(factors: Tensor, scales: Tensor, eps: float) -> Tensor:
+        gram = factors @ factors.transpose(1, 2)
+        diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+        rho = gram / (diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2)).sqrt().clamp_min(eps)
+        denominator = scales.unsqueeze(-2)
+        denominator = torch.where(denominator.abs() < eps, denominator.new_full((), eps), denominator)
+        return rho * scales.unsqueeze(-1) / denominator
+
+
 def _make_encoder(encoder_type: str, width: int) -> nn.Module:
     encoders = {
         "tcn": lambda: SharedTemporalEncoder(width),
@@ -328,143 +383,112 @@ def _make_encoder(encoder_type: str, width: int) -> nn.Module:
 
 
 class AmortizedLK(nn.Module):
-    """Permutation-equivariant direct predictor of an approximate LK graph.
+    """Permutation-equivariant, label-free approximation of the LK graph.
 
-    The model predicts ``W_hat`` using shared per-variable temporal features,
-    optional DeepSets-style global context, and a configurable shared decoder. It obtains
-    ``H_hat`` through a randomized temporal projection (H1 in the design note)
-    and returns ``T_hat = H_hat * W_hat``. ``h_method="projection"`` selects
-    H1, ``"learned"`` selects H2, and ``"exact"`` computes the exact sample H
-    ratio as an H0 evaluation baseline. H0 does not solve for LK coefficients.
-    No dense LK solve is used at inference or by
-    :func:`stochastic_probe_residual_loss` during training.
-    The encoder sees centered, RMS-scaled, sign-canonicalized channels, making
-    its representation invariant to channel offsets and nonzero changes of
-    measurement units. Coefficients are converted back to input units.
+    ``exact`` computes only the covariance-ratio matrix, never the LK solve.
+    ``learned_low_rank`` constructs a PSD low-rank correlation matrix and
+    rescales it with exact per-channel RMS values.
     """
 
+    _H_ALIASES = {"learned": "learned_pair"}
+    _H_METHODS = {"exact", "projection", "learned_pair", "learned_low_rank"}
+
     def __init__(
-        self,
-        width: int = 32,
-        projection_rank: int = 64,
-        n_step: int = 1,
-        dt: float = 1.0,
-        h_method: str = "projection",
-        encoder_type: str = "tcn",
-        decoder_type: str = "pair_mlp",
-        use_global_context: bool = True,
-        low_rank: int = 16,
+        self, width: int = 32, projection_rank: int = 64, n_step: int = 1,
+        dt: float = 1.0, h_method: str = "projection", encoder_type: str = "tcn",
+        decoder_type: str = "pair_mlp", use_global_context: bool = True,
+        low_rank: int = 16, h_rank: int = 8, h_factor_hidden: Optional[int] = None,
+        h_structure: str = "correlation_psd",
     ):
         super().__init__()
-        if width < 1:
-            raise ValueError("width must be at least 1")
-        if projection_rank < 1:
-            raise ValueError("projection_rank must be at least 1")
+        if width < 1 or projection_rank < 1 or low_rank < 1:
+            raise ValueError("width, projection_rank, and low_rank must be at least 1")
+        h_method = self._H_ALIASES.get(h_method, h_method)
+        if h_method not in self._H_METHODS:
+            raise ValueError(f"unknown h_method {h_method!r}; choose {sorted(self._H_METHODS)}")
+        if h_method == "learned_low_rank" and h_rank < 1:
+            raise ValueError("h_rank must be at least 1 for learned_low_rank H")
+        if h_structure != "correlation_psd":
+            raise ValueError("only h_structure='correlation_psd' is currently supported")
         self.encoder = _make_encoder(encoder_type, width)
-        self.encoder_type = encoder_type
+        self.encoder_type, self.decoder_type = encoder_type, decoder_type
         decoder_types = {"pair_mlp", "bilinear", "low_rank", "bilinear_residual"}
         if decoder_type not in decoder_types:
             raise ValueError(f"unknown decoder_type {decoder_type!r}; choose {sorted(decoder_types)}")
-        if low_rank < 1:
-            raise ValueError("low_rank must be at least 1")
-        self.decoder_type = decoder_type
-        self.use_global_context = use_global_context
-        self.low_rank = low_rank
+        self.use_global_context, self.low_rank = use_global_context, low_rank
         self.global_phi = nn.Sequential(nn.Linear(width, width), nn.GELU())
         self.global_rho = nn.Sequential(nn.Linear(width, width), nn.GELU())
         self.edge_decoder = nn.Sequential(
-            nn.Linear(5 * width, 2 * width),
-            nn.GELU(),
-            nn.Linear(2 * width, width),
-            nn.GELU(),
-            nn.Linear(width, 1),
+            nn.Linear(5 * width, 2 * width), nn.GELU(), nn.Linear(2 * width, width),
+            nn.GELU(), nn.Linear(width, 1),
         ) if decoder_type in {"pair_mlp", "bilinear_residual"} else None
-        self.bilinear_decoder = BilinearEdgeDecoder(width) if decoder_type in {
-            "bilinear", "bilinear_residual"
-        } else None
+        self.bilinear_decoder = BilinearEdgeDecoder(width) if decoder_type in {"bilinear", "bilinear_residual"} else None
         self.low_rank_decoder = LowRankEdgeDecoder(width, low_rank) if decoder_type == "low_rank" else None
-        self.projection_rank = projection_rank
-        self.n_step = n_step
-        self.dt = dt
-        if h_method not in {"projection", "learned", "exact"}:
-            raise ValueError("h_method must be projection, learned, or exact")
-        self.h_method = h_method
+        self.projection_rank, self.n_step, self.dt = projection_rank, n_step, dt
+        self.h_method, self.h_rank, self.h_structure = h_method, h_rank, h_structure
         self.h_decoder = nn.Sequential(
-            nn.Linear(5 * width, 2 * width),
-            nn.GELU(),
-            nn.Linear(2 * width, width),
-            nn.GELU(),
-            nn.Linear(width, 1),
-        ) if h_method == "learned" else None
+            nn.Linear(5 * width, 2 * width), nn.GELU(), nn.Linear(2 * width, width),
+            nn.GELU(), nn.Linear(width, 1),
+        ) if h_method == "learned_pair" else None
+        self.low_rank_h_head = LowRankCorrelationHead(width, h_rank, h_factor_hidden) if h_method == "learned_low_rank" else None
 
-    def forward(
-        self,
-        x: Tensor,
-        *,
-        projection: Optional[Tensor] = None,
-        generator: Optional[torch.Generator] = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    def _features(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if x.ndim != 3:
             raise ValueError("x must have shape [batch, variables, time]")
-        batch, variables, _ = x.shape
         centered = x - x.mean(dim=-1, keepdim=True)
-        rms = centered.square().mean(dim=-1, keepdim=True).sqrt()
-        rms = rms.clamp_min(torch.finfo(x.dtype).eps)
+        rms = centered.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(torch.finfo(x.dtype).eps)
         anchor = centered.gather(-1, centered.abs().argmax(dim=-1, keepdim=True))
-        orientation = torch.where(anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor))
-        signed_scales = rms * orientation
+        signed_scales = rms * torch.where(anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor))
         h = self.encoder(centered / signed_scales)
-        if self.use_global_context:
-            global_context = self.global_rho(self.global_phi(h).mean(dim=1))
-        else:
-            global_context = torch.zeros_like(h.mean(dim=1))
+        context = self.global_rho(self.global_phi(h).mean(dim=1)) if self.use_global_context else torch.zeros_like(h.mean(dim=1))
+        return h, context, signed_scales.squeeze(-1), centered
 
-        needs_pair_features = (
-            self.decoder_type in {"pair_mlp", "bilinear_residual"}
-            or self.h_method == "learned"
-        )
+    def _coefficients(self, h: Tensor, context: Tensor, scales: Tensor) -> tuple[Tensor, Optional[Tensor]]:
+        variables = h.shape[1]
+        needs_pair = self.decoder_type in {"pair_mlp", "bilinear_residual"} or self.h_method == "learned_pair"
         source = h.unsqueeze(2).expand(-1, -1, variables, -1)
         target = h.unsqueeze(1).expand(-1, variables, -1, -1)
         pair_features = None
-        if needs_pair_features:
-            context = global_context[:, None, None, :].expand(-1, variables, variables, -1)
-            pair_features = torch.cat(
-                (source, target, source * target, source - target, context), dim=-1
-            )
+        if needs_pair:
+            global_edges = context[:, None, None, :].expand(-1, variables, variables, -1)
+            pair_features = torch.cat((source, target, source * target, source - target, global_edges), dim=-1)
         if self.decoder_type == "pair_mlp":
-            assert pair_features is not None
             w_normalized = self.edge_decoder(pair_features).squeeze(-1)
         elif self.decoder_type == "bilinear":
-            w_normalized = self.bilinear_decoder(source, target, global_context)
+            w_normalized = self.bilinear_decoder(source, target, context)
         elif self.decoder_type == "low_rank":
-            w_normalized = self.low_rank_decoder(h, global_context)
+            w_normalized = self.low_rank_decoder(h, context)
         else:
-            assert pair_features is not None
-            w_normalized = (
-                self.bilinear_decoder(source, target, global_context)
-                + self.edge_decoder(pair_features).squeeze(-1)
-            )
-        # If x_i is divided by signed s_i before encoding, its coefficient
-        # matrix is W_normalized[i,j] = W_physical[i,j] * s_i / s_j.
-        scales = signed_scales.squeeze(-1)
-        w_hat = w_normalized * scales.unsqueeze(1) / scales.unsqueeze(2)
+            w_normalized = self.bilinear_decoder(source, target, context) + self.edge_decoder(pair_features).squeeze(-1)
+        return w_normalized * scales.unsqueeze(1) / scales.unsqueeze(2), pair_features
+
+    def predict_coefficients(self, x: Tensor) -> Tensor:
+        """Predict W only, avoiding all covariance-ratio work."""
+        h, context, scales, _ = self._features(x)
+        return self._coefficients(h, context, scales)[0]
+
+    def score_h_pairs(self, x: Tensor, pairs: Tensor) -> Tensor:
+        """Score selected H pairs without materializing the dense H matrix."""
+        if self.h_method != "learned_low_rank":
+            raise ValueError("selected-pair scoring is available for learned_low_rank H only")
+        h, context, scales, _ = self._features(x)
+        factors = self.low_rank_h_head.factors(h, context)
+        return self.low_rank_h_head.score_pairs(factors, scales, pairs, torch.finfo(x.dtype).eps)
+
+    def forward(self, x: Tensor, *, projection: Optional[Tensor] = None,
+                generator: Optional[torch.Generator] = None, compute_graph: bool = True
+    ) -> tuple[Optional[Tensor], Tensor, Optional[Tensor]]:
+        h, context, scales, _ = self._features(x)
+        w_hat, pair_features = self._coefficients(h, context, scales)
+        if not compute_graph:
+            return None, w_hat, None
         if self.h_method == "projection":
-            h_hat = random_projection_covariance_ratio(
-                x,
-                rank=self.projection_rank,
-                n_step=self.n_step,
-                dt=self.dt,
-                projection=projection,
-                generator=generator,
-            )
-        elif self.h_method == "learned":
-            assert pair_features is not None
+            h_hat = random_projection_covariance_ratio(x, rank=self.projection_rank, n_step=self.n_step, dt=self.dt, projection=projection, generator=generator)
+        elif self.h_method == "learned_pair":
             h_hat = self.h_decoder(pair_features).squeeze(-1)
+        elif self.h_method == "learned_low_rank":
+            factors = self.low_rank_h_head.factors(h, context)
+            h_hat = self.low_rank_h_head.materialize(factors, scales, torch.finfo(x.dtype).eps)
         else:
-            if self.training:
-                raise RuntimeError("h_method='exact' is evaluation-only; call eval() first")
-            h_hat = exact_covariance_ratio(
-                x, n_step=self.n_step, dt=self.dt
-            )
-        t_hat = h_hat * w_hat
-        return t_hat, w_hat, h_hat
+            h_hat = exact_covariance_ratio(x, n_step=self.n_step, dt=self.dt)
+        return h_hat * w_hat, w_hat, h_hat
