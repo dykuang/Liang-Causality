@@ -510,14 +510,15 @@ class AmortizedLK(nn.Module):
         h, context, scales, _ = self._features(x)
         return self._coefficients(h, context, scales)[0]
 
-    def predict_covariance_ratio(
+    def _predict_covariance_ratio(
         self,
         x: Tensor,
         *,
         projection: Optional[Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        feature_state: Optional[tuple[Tensor, Tensor, Tensor]] = None,
+        pair_features: Optional[Tensor] = None,
     ) -> Tensor:
-        """Predict H alone without running the coefficient decoder for W."""
         if self.h_method == "exact":
             return exact_covariance_ratio(x, n_step=self.n_step, dt=self.dt)
         if self.h_method == "projection":
@@ -526,12 +527,29 @@ class AmortizedLK(nn.Module):
                 projection=projection, generator=generator,
             )
 
-        h, context, scales, _ = self._features(x)
+        if feature_state is None:
+            h, context, scales, _ = self._features(x)
+        else:
+            h, context, scales = feature_state
         if self.h_method == "learned_pair":
-            return self.h_decoder(self._pair_features(h, context)).squeeze(-1)
+            if pair_features is None:
+                pair_features = self._pair_features(h, context)
+            return self.h_decoder(pair_features).squeeze(-1)
         factors = self.low_rank_h_head.factors(h, context)
         return self.low_rank_h_head.materialize(
             factors, scales, torch.finfo(x.dtype).eps
+        )
+
+    def predict_covariance_ratio(
+        self,
+        x: Tensor,
+        *,
+        projection: Optional[Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tensor:
+        """Predict H alone without running the coefficient decoder for W."""
+        return self._predict_covariance_ratio(
+            x, projection=projection, generator=generator
         )
 
     def score_h_pairs(self, x: Tensor, pairs: Tensor) -> Tensor:
@@ -549,13 +567,11 @@ class AmortizedLK(nn.Module):
         w_hat, pair_features = self._coefficients(h, context, scales)
         if not compute_graph:
             return None, w_hat, None
-        if self.h_method == "projection":
-            h_hat = random_projection_covariance_ratio(x, rank=self.projection_rank, n_step=self.n_step, dt=self.dt, projection=projection, generator=generator)
-        elif self.h_method == "learned_pair":
-            h_hat = self.h_decoder(pair_features).squeeze(-1)
-        elif self.h_method == "learned_low_rank":
-            factors = self.low_rank_h_head.factors(h, context)
-            h_hat = self.low_rank_h_head.materialize(factors, scales, torch.finfo(x.dtype).eps)
-        else:
-            h_hat = exact_covariance_ratio(x, n_step=self.n_step, dt=self.dt)
+        h_hat = self._predict_covariance_ratio(
+            x,
+            projection=projection,
+            generator=generator,
+            feature_state=(h, context, scales),
+            pair_features=pair_features,
+        )
         return h_hat * w_hat, w_hat, h_hat

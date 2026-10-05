@@ -1,4 +1,4 @@
-"""Train the amortized LK operator using equation residuals only.
+"""Train the amortized LK operator with residual and optional sampled-H losses.
 
 This entry point deliberately has no dependency on the exact LK estimator.
 The built-in data source generates stable VAR windows without computing LK
@@ -12,7 +12,12 @@ from pathlib import Path
 
 import torch
 
-from amortized_lk import AmortizedLK, sampled_covariance_ratio_loss, stochastic_probe_residual_loss
+from amortized_lk import (
+    AmortizedLK,
+    sampled_covariance_ratio_loss,
+    sampled_covariance_ratio_pair_loss,
+    stochastic_probe_residual_loss,
+)
 
 
 def stable_var_batch(
@@ -50,6 +55,68 @@ def stable_var_batch(
     return states.transpose(1, 2).contiguous()
 
 
+def train_amortized_step(
+    model: AmortizedLK,
+    optimizer: torch.optim.Optimizer,
+    windows: torch.Tensor,
+    *,
+    probes: int,
+    ridge_scale: float,
+    loss_mode: str,
+    probe_distribution: str,
+    generator: torch.Generator,
+    n_step: int = 1,
+    dt: float = 1.0,
+    h_weight: float = 0.0,
+    h_pairs: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one coefficient-residual update and optional sampled-H update."""
+    has_sampled_h_objective = (
+        h_weight != 0
+        and h_pairs > 0
+        and model.h_method in {"learned_pair", "learned_low_rank"}
+    )
+    predict_dense_h = has_sampled_h_objective and model.h_method == "learned_pair"
+    _, coefficients, h_hat = model(
+        windows, generator=generator, compute_graph=predict_dense_h
+    )
+    equation_loss = stochastic_probe_residual_loss(
+        windows,
+        coefficients,
+        q=probes,
+        ridge_scale=ridge_scale,
+        loss_mode=loss_mode,
+        probe_distribution=probe_distribution,
+        n_step=n_step,
+        dt=dt,
+        generator=generator,
+    )
+    h_loss = equation_loss.new_zeros(())
+    if has_sampled_h_objective:
+        pairs = torch.randint(
+            windows.shape[1],
+            (h_pairs, 2),
+            device=windows.device,
+            generator=generator,
+        )
+        if model.h_method == "learned_low_rank":
+            predictions = model.score_h_pairs(windows, pairs)
+            h_loss = sampled_covariance_ratio_pair_loss(
+                windows, predictions, pairs, n_step=n_step, dt=dt
+            )
+        else:
+            if h_hat is None:
+                raise RuntimeError("learned_pair training requires predicted H")
+            h_loss = sampled_covariance_ratio_loss(
+                windows, h_hat, pairs, n_step=n_step, dt=dt
+            )
+    total_loss = equation_loss + h_weight * h_loss
+    optimizer.zero_grad(set_to_none=True)
+    total_loss.backward()
+    optimizer.step()
+    return equation_loss.detach(), h_loss.detach()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--steps", type=int, default=1000)
@@ -70,7 +137,10 @@ def main() -> None:
     parser.add_argument("--ridge-scale", type=float, default=1e-3)
     parser.add_argument("--loss-mode", choices=("plain", "normalized", "jacobi"), default="plain")
     parser.add_argument("--probe-distribution", choices=("rademacher", "gaussian", "orthogonal"), default="rademacher")
-    parser.add_argument("--h-method", choices=("projection", "learned"), default="projection")
+    parser.add_argument(
+        "--h-method", choices=("projection", "learned_pair", "learned"),
+        default="projection",
+    )
     parser.add_argument("--n-step", type=int, default=1)
     parser.add_argument("--dt", type=float, default=1.0)
     parser.add_argument("--h-weight", type=float, default=1.0)
@@ -119,35 +189,20 @@ def main() -> None:
             dtype=torch.float32,
             generator=generator,
         )
-        _, w_hat, h_hat = model(windows, generator=generator)
-        equation_loss = stochastic_probe_residual_loss(
+        equation_loss, h_loss = train_amortized_step(
+            model,
+            optimizer,
             windows,
-            w_hat,
-            q=args.probes,
+            probes=args.probes,
             ridge_scale=args.ridge_scale,
             loss_mode=args.loss_mode,
             probe_distribution=args.probe_distribution,
+            generator=generator,
             n_step=args.n_step,
             dt=args.dt,
-            generator=generator,
+            h_weight=args.h_weight,
+            h_pairs=args.h_pairs,
         )
-        total_loss = equation_loss
-        h_loss = equation_loss.new_zeros(())
-        if args.h_method == "learned":
-            pairs = torch.randint(
-                variables,
-                (args.h_pairs, 2),
-                device=device,
-                generator=generator,
-            )
-            h_loss = sampled_covariance_ratio_loss(
-                windows, h_hat, pairs, n_step=args.n_step, dt=args.dt
-            )
-            total_loss = total_loss + args.h_weight * h_loss
-
-        optimizer.zero_grad(set_to_none=True)
-        total_loss.backward()
-        optimizer.step()
 
         if step == 1 or step % 100 == 0 or step == args.steps:
             print(
@@ -159,7 +214,9 @@ def main() -> None:
     torch.save(
         {
             "state_dict": model.state_dict(),
-            "config": vars(args) | {"output": str(args.output)},
+            "config": vars(args) | {
+                "output": str(args.output), "h_method": model.h_method,
+            },
         },
         args.output,
     )

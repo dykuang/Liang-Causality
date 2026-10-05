@@ -39,6 +39,36 @@ class BenchmarkConfigTests(unittest.TestCase):
 
                 self.assertEqual(batch.dtype, torch.float64)
 
+    def test_gpu_h_variant_config_covers_planned_rank_sweep(self):
+        config = yaml.safe_load(
+            (Path(__file__).resolve().parents[1] / "experiments/gpu_h_variants.yaml").read_text(encoding="utf-8")
+        )
+        variants = config["variants"]
+        projection_ranks = sorted(
+            variant["projection_rank"]
+            for variant in variants
+            if variant.get("h_method") == "projection"
+        )
+        low_rank_h_ranks = sorted(
+            variant["h_rank"]
+            for variant in variants
+            if variant.get("h_method") == "learned_low_rank"
+        )
+
+        self.assertEqual(projection_ranks, [8, 16, 32, 64])
+        self.assertEqual(low_rank_h_ranks, [4, 8, 16, 32])
+
+    def test_validation_canonicalizes_legacy_learned_h_method(self):
+        config = {
+            "runtime": {"device": "cpu", "dtype": "float32"},
+            "training": {},
+            "variants": [{"mode": "amortized", "h_method": "learned"}],
+        }
+
+        validated = validate_config(config)
+
+        self.assertEqual(validated["variants"][0]["h_method"], "learned_pair")
+
     def test_validation_resolves_requested_dtype_without_losing_runtime_config(self):
         config = {
             "runtime": {"device": "cpu", "dtype": "float32"},
@@ -74,6 +104,47 @@ class BenchmarkResultTests(unittest.TestCase):
 
         self.assertEqual(exact, {"requested_dtype": "bfloat16", "effective_dtype": "float32"})
         self.assertEqual(amortized, {"requested_dtype": "bfloat16", "effective_dtype": "bfloat16"})
+
+    def test_run_canonicalizes_legacy_h_method_in_saved_config_and_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_config = root / "legacy.yaml"
+            output_dir = root / "results"
+            config = {
+                "runtime": {
+                    "device": "cpu", "dtype": "float32", "compile": False,
+                    "warmup_repeats": 0, "timing_repeats": 1,
+                },
+                "seed": 19,
+                "output_dir": str(output_dir),
+                "training": {
+                    "steps": 0, "batch_size": 1, "learning_rate": 0.002,
+                    "probes": 1, "ridge_scale": 0.001, "loss_mode": "plain",
+                    "probe_distribution": "rademacher", "h_pairs": 2,
+                    "h_weight": 1.0, "width": 4, "low_rank": 2,
+                },
+                "examples": [{
+                    "name": "tiny", "generator": "stable_var",
+                    "variables": 2, "time": 8, "eval_examples": 1,
+                    "training_steps": 0, "training_batch_size": 1,
+                }],
+                "variants": [{
+                    "name": "legacy_learned", "mode": "amortized",
+                    "encoder_type": "downsample_mlp", "decoder_type": "low_rank",
+                    "low_rank": 2, "h_method": "learned",
+                }],
+            }
+            source_config.write_text(yaml.safe_dump(config), encoding="utf-8")
+            original_source = source_config.read_bytes()
+
+            csv_path, _ = run(source_config)
+
+            saved = yaml.safe_load((output_dir / "config.yaml").read_text(encoding="utf-8"))
+            with csv_path.open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual(source_config.read_bytes(), original_source)
+            self.assertEqual(saved["variants"][0]["h_method"], "learned_pair")
+            self.assertEqual(rows[0]["h_method"], "learned_pair")
 
     def test_rows_and_copied_config_can_be_reproduced_without_cuda(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -124,6 +195,14 @@ class BenchmarkResultTests(unittest.TestCase):
                         "low_rank": 2,
                         "h_method": "exact",
                     },
+                    {
+                        "name": "amortized_exact_h_same_arch",
+                        "mode": "amortized",
+                        "encoder_type": "downsample_mlp",
+                        "decoder_type": "low_rank",
+                        "low_rank": 2,
+                        "h_method": "exact",
+                    },
                 ],
             }
             source_config.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -145,8 +224,16 @@ class BenchmarkResultTests(unittest.TestCase):
                 [
                     ("exact_graph_only", "float32", "float32"),
                     ("amortized_exact_h", "float32", "float32"),
+                    ("amortized_exact_h_same_arch", "float32", "float32"),
                 ],
             )
+            shared_seed_metrics = (
+                "graph_mse", "graph_mae", "magnitude_rank_corr",
+                "strong_sign_accuracy", "support_f1_q75", "h_mse",
+                "h_magnitude_rank_corr",
+            )
+            for metric in shared_seed_metrics:
+                self.assertEqual(first_rows[1][metric], first_rows[2][metric], metric)
 
             reproduced_csv_path, _ = run(copied_config)
             with reproduced_csv_path.open(newline="", encoding="utf-8") as handle:

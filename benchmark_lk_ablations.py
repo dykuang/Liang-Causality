@@ -16,13 +16,10 @@ try:
 except ImportError as exc:
     raise SystemExit("PyYAML is required; install with `pip install pyyaml`.") from exc
 
-from amortized_lk import (
-    AmortizedLK, sampled_covariance_ratio_loss, sampled_covariance_ratio_pair_loss,
-    stochastic_probe_residual_loss, exact_covariance_ratio,
-)
+from amortized_lk import AmortizedLK, exact_covariance_ratio
 from evaluate_amortized_lk import exact_lk_graph
 from lk_estimators import LKEstimator
-from train_amortized_lk import stable_var_batch
+from train_amortized_lk import stable_var_batch, train_amortized_step
 
 
 def _timing(fn, repeats: int, warmup: int, device: torch.device) -> tuple[float, float]:
@@ -189,39 +186,35 @@ def _train_variant(
             device=device,
             generator=data_generator, dtype=dtype,
         )
-        _, w_hat, _ = model(x, generator=probe_generator, compute_graph=False)
-        loss = stochastic_probe_residual_loss(
+        train_amortized_step(
+            model,
+            optimizer,
             x,
-            w_hat,
-            q=training["probes"],
+            probes=training["probes"],
             ridge_scale=training["ridge_scale"],
             loss_mode=training["loss_mode"],
             probe_distribution=training["probe_distribution"],
+            generator=probe_generator,
             n_step=example.get("n_step", 1),
             dt=example.get("dt", 1.0),
-            generator=probe_generator,
+            h_weight=training.get("h_weight", 0.0),
+            h_pairs=training.get("h_pairs", 0),
         )
-        if model.h_method in {"learned_pair", "learned_low_rank"}:
-            pairs = torch.randint(
-                example["variables"],
-                (training["h_pairs"], 2),
-                device=device,
-                generator=probe_generator,
-            )
-            if model.h_method == "learned_low_rank":
-                pair_predictions = model.score_h_pairs(x, pairs)
-                h_loss = sampled_covariance_ratio_pair_loss(x, pair_predictions, pairs, n_step=example.get("n_step", 1), dt=example.get("dt", 1.0))
-            else:
-                _, _, h_hat = model(x, generator=probe_generator)
-                h_loss = sampled_covariance_ratio_loss(x, h_hat, pairs, n_step=example.get("n_step", 1), dt=example.get("dt", 1.0))
-            loss = loss + training["h_weight"] * h_loss
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        optimizer.step()
     return model.eval(), time.perf_counter() - start
 
 
+def _canonicalize_h_method_aliases(config: dict) -> bool:
+    """Rewrite accepted legacy H names to their canonical serialized names."""
+    changed = False
+    for variant in config.get("variants", []):
+        if variant.get("h_method") == "learned":
+            variant["h_method"] = "learned_pair"
+            changed = True
+    return changed
+
+
 def validate_config(config: dict) -> dict:
+    _canonicalize_h_method_aliases(config)
     runtime = dict(config.get("runtime", {}))
     runtime.setdefault("device", config.get("device", "cpu"))
     runtime.setdefault("dtype", "float32")
@@ -260,7 +253,10 @@ def result_precision_metadata(
 
 def run(config_path: Path) -> tuple[Path, Path]:
     config_path = config_path.resolve()
-    config = validate_config(yaml.safe_load(config_path.read_text(encoding="utf-8")))
+    config_text = config_path.read_text(encoding="utf-8")
+    saved_config = yaml.safe_load(config_text)
+    has_canonicalized_aliases = _canonicalize_h_method_aliases(saved_config)
+    config = validate_config(yaml.safe_load(config_text))
     runtime, dtype = config["runtime"], config["dtype"]
     device = torch.device(runtime["device"])
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -271,15 +267,20 @@ def run(config_path: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     copied_config_path = output_dir / "config.yaml"
     if copied_config_path != config_path:
-        shutil.copyfile(config_path, copied_config_path)
+        if has_canonicalized_aliases:
+            copied_config_path.write_text(
+                yaml.safe_dump(saved_config, sort_keys=False), encoding="utf-8"
+            )
+        else:
+            shutil.copyfile(config_path, copied_config_path)
     rows, base_seed = [], int(config.get("seed", 0))
     for example_index, example in enumerate(config["examples"]):
         seed = base_seed + example_index * 100_000
         evaluation = _example_batch(example, int(example.get("eval_examples", 8)), device=device, generator=torch.Generator(device=device).manual_seed(seed + 7), dtype=dtype)
         fitted = []
-        for index, variant in enumerate(config["variants"]):
+        for variant in config["variants"]:
             if variant.get("mode") in {"exact", "exact_graph", "exact_graph_solve_ex"}: fitted.append((variant, None, 0.0))
-            elif variant.get("mode") == "amortized": fitted.append((variant, *_train_variant(variant, config, example, seed=seed + index * 1000, data_seed=seed)))
+            elif variant.get("mode") == "amortized": fitted.append((variant, *_train_variant(variant, config, example, seed=seed, data_seed=seed)))
             else: raise ValueError(f"unknown mode {variant.get('mode')!r}")
         n_step, dt = int(example.get("n_step", 1)), float(example.get("dt", 1.0))
         exact_estimator = LKEstimator(mode="exact", n_step=n_step, dt=dt).to(device=device, dtype=torch.float32).eval()

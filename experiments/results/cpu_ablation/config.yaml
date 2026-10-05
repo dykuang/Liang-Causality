@@ -1,11 +1,8 @@
-# Reproducible CPU ablation suite. Run from the repository root:
-#   python benchmark_lk_ablations.py experiments/ablation_cpu.yaml
 device: cpu
 num_threads: 1
 seed: 20260928
 output_dir: experiments/results/cpu_ablation
 timing_repeats: 20
-
 training:
   steps: 150
   batch_size: 8
@@ -18,65 +15,63 @@ training:
   h_weight: 1.0
   width: 16
   low_rank: 8
-
 examples:
-  - name: small_oscillator_p2_t256
-    generator: oscillator
-    variables: 2
-    time: 256
-    eval_examples: 8
-  - name: repository_6d_t512
-    generator: repository6d
-    variables: 6
-    time: 512
-    eval_examples: 8
-  - name: sparse_var_p32_t512
-    generator: stable_var
-    variables: 32
-    time: 512
-    eval_examples: 4
-    edge_probability: 0.08
-    training_steps: 80
-    training_batch_size: 4
-
+- name: small_oscillator_p2_t256
+  generator: oscillator
+  variables: 2
+  time: 256
+  eval_examples: 8
+- name: repository_6d_t512
+  generator: repository6d
+  variables: 6
+  time: 512
+  eval_examples: 8
+- name: sparse_var_p32_t512
+  generator: stable_var
+  variables: 32
+  time: 512
+  eval_examples: 4
+  edge_probability: 0.08
+  training_steps: 80
+  training_batch_size: 4
 variants:
-  - name: exact_lk
-    mode: exact
-  - name: exact_graph_only
-    mode: exact_graph
-  - name: tcn_pair_h1
-    mode: amortized
-    encoder_type: tcn
-    decoder_type: pair_mlp
-    h_method: projection
-    use_global_context: true
-  - name: tcn_pair_h0_exact_H
-    mode: amortized
-    encoder_type: tcn
-    decoder_type: pair_mlp
-    h_method: exact
-    use_global_context: true
-  - name: tcn_pair_h2
-    mode: amortized
-    encoder_type: tcn
-    decoder_type: pair_mlp
-    h_method: learned
-    use_global_context: true
-  - name: downsample_bilinear_h1
-    mode: amortized
-    encoder_type: downsample_mlp
-    decoder_type: bilinear
-    h_method: projection
-    use_global_context: true
-  - name: spectral_lowrank_h1
-    mode: amortized
-    encoder_type: spectral
-    decoder_type: low_rank
-    h_method: projection
-    use_global_context: true
-  - name: attention_bilinear_residual_h1
-    mode: amortized
-    encoder_type: attention
-    decoder_type: bilinear_residual
-    h_method: projection
-    use_global_context: true
+- name: exact_lk
+  mode: exact
+- name: exact_graph_only
+  mode: exact_graph
+- name: tcn_pair_h1
+  mode: amortized
+  encoder_type: tcn
+  decoder_type: pair_mlp
+  h_method: projection
+  use_global_context: true
+- name: tcn_pair_h0_exact_H
+  mode: amortized
+  encoder_type: tcn
+  decoder_type: pair_mlp
+  h_method: exact
+  use_global_context: true
+- name: tcn_pair_h2
+  mode: amortized
+  encoder_type: tcn
+  decoder_type: pair_mlp
+  h_method: learned_pair
+  use_global_context: true
+- name: downsample_bilinear_h1
+  mode: amortized
+  encoder_type: downsample_mlp
+  decoder_type: bilinear
+  h_method: projection
+  use_global_context: true
+- name: spectral_lowrank_h1
+  mode: amortized
+  encoder_type: spectral
+  decoder_type: low_rank
+  h_method: projection
+  use_global_context: true
+- name: attention_bilinear_residual_h1
+  mode: amortized
+  encoder_type: attention
+  decoder_type: bilinear_residual
+  h_method: projection
+  use_global_context: true
