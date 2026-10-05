@@ -206,7 +206,7 @@ def _train_variant(
     return model.eval(), time.perf_counter() - start
 
 
-def _validate(config: dict) -> dict:
+def validate_config(config: dict) -> dict:
     runtime = dict(config.get("runtime", {}))
     runtime.setdefault("device", config.get("device", "cpu"))
     runtime.setdefault("dtype", "float32")
@@ -233,9 +233,19 @@ def _validate(config: dict) -> dict:
     return config
 
 
+def result_precision_metadata(
+    requested_dtype: str, graph_output: torch.Tensor
+) -> dict[str, str]:
+    """Describe requested precision and the dtype of the measured graph output."""
+    return {
+        "requested_dtype": requested_dtype,
+        "effective_dtype": str(graph_output.dtype).removeprefix("torch."),
+    }
+
+
 def run(config_path: Path) -> tuple[Path, Path]:
     config_path = config_path.resolve()
-    config = _validate(yaml.safe_load(config_path.read_text(encoding="utf-8")))
+    config = validate_config(yaml.safe_load(config_path.read_text(encoding="utf-8")))
     runtime, dtype = config["runtime"], config["dtype"]
     device = torch.device(runtime["device"])
     if device.type == "cuda" and not torch.cuda.is_available():
@@ -243,7 +253,10 @@ def run(config_path: Path) -> tuple[Path, Path]:
     if device.type == "cpu": torch.set_num_threads(int(config.get("num_threads", 1)))
     output_dir = Path(config.get("output_dir", "results/ablations"))
     output_dir = (Path.cwd() / output_dir if not output_dir.is_absolute() else output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True); shutil.copyfile(config_path, output_dir / "config.yaml")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    copied_config_path = output_dir / "config.yaml"
+    if copied_config_path != config_path:
+        shutil.copyfile(config_path, copied_config_path)
     rows, base_seed = [], int(config.get("seed", 0))
     for example_index, example in enumerate(config["examples"]):
         seed = base_seed + example_index * 100_000
@@ -257,16 +270,22 @@ def run(config_path: Path) -> tuple[Path, Path]:
         exact_estimator = LKEstimator(mode="exact", n_step=n_step, dt=dt).to(device=device, dtype=torch.float32).eval()
         exact_input = evaluation.float() if dtype != torch.float32 else evaluation
         with torch.no_grad():
-            reference = exact_estimator(exact_input).graph.to(dtype)
-            graph_reference = exact_lk_graph(exact_input, n_step=n_step, dt=dt)[0].to(dtype)
+            exact_reference = exact_estimator(exact_input).graph
+            graph_only_reference = exact_lk_graph(exact_input, n_step=n_step, dt=dt)[0]
+            reference = exact_reference
+            graph_reference = graph_only_reference
             h_reference = exact_covariance_ratio(evaluation, n_step=n_step, dt=dt)
         exact_time = _timing(lambda: exact_estimator(exact_input), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
         graph_time = _timing(lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
         for variant, model, train_seconds in fitted:
             peak = 0.0
-            if variant["mode"] == "exact": prediction, h_hat, timer = reference, h_reference, lambda: exact_estimator(exact_input)
-            elif variant["mode"] == "exact_graph": prediction, h_hat, timer = graph_reference, h_reference, lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt)
-            elif variant["mode"] == "exact_graph_solve_ex": prediction, h_hat, timer = _exact_graph_solve_ex(exact_input, n_step, dt).to(dtype), h_reference, lambda: _exact_graph_solve_ex(exact_input, n_step, dt)
+            if variant["mode"] == "exact":
+                prediction, h_hat, timer = reference, h_reference, lambda: exact_estimator(exact_input)
+            elif variant["mode"] == "exact_graph":
+                prediction, h_hat, timer = graph_reference, h_reference, lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt)
+            elif variant["mode"] == "exact_graph_solve_ex":
+                solve_ex_reference = _exact_graph_solve_ex(exact_input, n_step, dt)
+                prediction, h_hat, timer = solve_ex_reference, h_reference, lambda: _exact_graph_solve_ex(exact_input, n_step, dt)
             else:
                 assert model is not None
                 projection = None
@@ -282,7 +301,7 @@ def run(config_path: Path) -> tuple[Path, Path]:
             if device.type == "cuda": peak = torch.cuda.max_memory_allocated(device) / 2**20
             metrics = _metrics(prediction, reference)
             h_metrics = _metrics(h_hat, h_reference) if h_hat is not None else {"graph_mse": float("nan"), "magnitude_rank_corr": float("nan")}
-            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), "requested_dtype": runtime["dtype"], "effective_dtype": "float32" if variant["mode"].startswith("exact") else runtime["dtype"], "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["graph_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
+            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), **result_precision_metadata(runtime["dtype"], prediction), "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["graph_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
             rows.append(row); print(f"measured {row['example']} / {row['variant']}: {row['inference_ms']:.3f}ms")
     csv_path = output_dir / "results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
