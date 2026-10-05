@@ -408,6 +408,16 @@ class LowRankCorrelationHead(nn.Module):
         return normalized_factors, output_dtype, torch.finfo(compute_dtype).eps
 
     @staticmethod
+    def _normalized_inner_product(
+        inner_product: Tensor,
+        left_squared_norm: Tensor,
+        right_squared_norm: Tensor,
+        eps: float,
+    ) -> Tensor:
+        denominator = (left_squared_norm * right_squared_norm).sqrt().clamp_min(eps)
+        return inner_product / denominator
+
+    @staticmethod
     def score_pairs(factors: Tensor, scales: Tensor, pairs: Tensor, eps: float) -> Tensor:
         pairs = pairs.to(device=factors.device, dtype=torch.long)
         i, j = pairs.unbind(dim=1)
@@ -415,8 +425,12 @@ class LowRankCorrelationHead(nn.Module):
             LowRankCorrelationHead._normalization_factors(factors)
         )
         u_i, u_j = normalized_factors[:, i], normalized_factors[:, j]
-        rho = (u_i * u_j).sum(dim=-1)
-        rho = rho / (u_i.square().sum(dim=-1) * u_j.square().sum(dim=-1)).sqrt().clamp_min(normalization_eps)
+        rho = LowRankCorrelationHead._normalized_inner_product(
+            (u_i * u_j).sum(dim=-1),
+            u_i.square().sum(dim=-1),
+            u_j.square().sum(dim=-1),
+            normalization_eps,
+        )
         scale_ratio = LowRankCorrelationHead._scale_ratio(
             scales[:, i], scales[:, j], eps
         )
@@ -429,7 +443,9 @@ class LowRankCorrelationHead(nn.Module):
         )
         gram = normalized_factors @ normalized_factors.transpose(1, 2)
         diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
-        rho = gram / (diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2)).sqrt().clamp_min(eps)
+        rho = LowRankCorrelationHead._normalized_inner_product(
+            gram, diagonal.unsqueeze(-1), diagonal.unsqueeze(-2), eps
+        )
         return rho.to(dtype=output_dtype)
 
     @staticmethod
