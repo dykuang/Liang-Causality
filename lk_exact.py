@@ -1,0 +1,86 @@
+"""Graph-only exact Torch Liang–Kleeman estimation."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+from torch import Tensor
+
+from lk_statistics import LKStatistics
+
+
+@dataclass(frozen=True, eq=False)
+class ExactGraphResult:
+    """Exact graph outputs and the dtype used for their computation.
+
+    The tensors have shape ``[batch, variables, variables]``. ``effective_dtype``
+    records the dtype used by the covariance calculations and linear solve.
+    """
+
+    graph: Tensor
+    coefficients: Tensor
+    covariance_ratio: Tensor
+    effective_dtype: torch.dtype
+
+
+def estimate_exact_graph(statistics: LKStatistics) -> ExactGraphResult:
+    """Estimate the exact LK graph from prepared sufficient statistics.
+
+    The coefficient matrix is ``solve(C, D)`` and the graph is the
+    elementwise product of that matrix with the covariance ratio. A batched
+    ``solve_ex`` attempts every window independently; only windows with a
+    nonzero status use a pseudoinverse fallback. This keeps one singular
+    covariance from interrupting well-conditioned windows in the batch.
+
+    Half and bfloat16 statistics are promoted to float32 before dense
+    statistics are materialized. The result reports that effective dtype.
+    """
+    if not isinstance(statistics, LKStatistics):
+        raise TypeError("statistics must be an LKStatistics value")
+
+    state = statistics.state
+    derivative = statistics.derivative
+    if not isinstance(state, Tensor) or not isinstance(derivative, Tensor):
+        raise TypeError("LK statistics state and derivative must be tensors")
+    if state.ndim != 3 or derivative.shape != state.shape:
+        raise ValueError("LK statistics must have matching [batch, variables, samples] tensors")
+    if state.shape[-1] < 2:
+        raise ValueError("at least two samples are required for exact LK estimation")
+    if state.device != derivative.device or state.dtype != derivative.dtype:
+        raise ValueError("LK statistics state and derivative must share device and dtype")
+    if not state.is_floating_point():
+        raise TypeError("LK statistics must use a floating-point dtype")
+
+    effective_dtype = state.dtype
+    if effective_dtype in (torch.float16, torch.bfloat16):
+        effective_dtype = torch.float32
+        state = state.to(dtype=effective_dtype)
+        derivative = derivative.to(dtype=effective_dtype)
+        statistics = LKStatistics(
+            state=state,
+            derivative=derivative,
+            n_step=statistics.n_step,
+            dt=statistics.dt,
+        )
+
+    covariance = statistics.covariance
+    cross_covariance = statistics.cross_covariance
+    covariance_ratio = statistics.covariance_ratio
+
+    coefficients, info = torch.linalg.solve_ex(
+        covariance, cross_covariance, check_errors=False
+    )
+    failed = info != 0
+    if failed.any():
+        fallback = torch.linalg.pinv(covariance[failed]) @ cross_covariance[failed]
+        coefficients = coefficients.clone()
+        coefficients[failed] = fallback
+
+    graph = covariance_ratio * coefficients
+    return ExactGraphResult(
+        graph=graph,
+        coefficients=coefficients,
+        covariance_ratio=covariance_ratio,
+        effective_dtype=effective_dtype,
+    )

@@ -39,6 +39,17 @@ learned = LKEstimator(mode="amortized", amortized_model=model)
 learned_result = learned(windows)
 ```
 
+For graph-only exact estimation from prepared statistics, use `estimate_exact_graph`. It returns an `ExactGraphResult` with graph, coefficients, covariance ratio, and the effective computation dtype. Singular covariance falls back to a pseudoinverse for only the affected batch windows. `evaluate_amortized_lk.exact_lk_graph` remains available as a tuple-returning compatibility adapter.
+
+```python
+from lk_exact import estimate_exact_graph
+from lk_statistics import prepare_lk_statistics
+
+prepared = prepare_lk_statistics(windows, n_step=1, dt=1.0)
+exact_graph_result = estimate_exact_graph(prepared)
+graph = exact_graph_result.graph
+```
+
 The learned architecture is configurable with `encoder_type="tcn" | "downsample_mlp" | "spectral" | "attention"`, `decoder_type="pair_mlp" | "bilinear" | "low_rank" | "bilinear_residual"`, and `h_method="projection" | "learned_pair" | "learned_low_rank" | "exact"` (`learned` remains an alias for `learned_pair`). Exact H is a regular label-free mode: it computes the covariance-ratio factor but never an LK coefficient solve. Use `compute_graph=False` when coefficient-residual training does not need a graph.
 
 ### CPU ablation

@@ -13,26 +13,23 @@ from pathlib import Path
 
 import torch
 
-from amortized_lk import exact_covariance_ratio
 from lk_estimators import load_amortized_checkpoint
+from lk_exact import estimate_exact_graph
+from lk_statistics import prepare_lk_statistics
 from train_amortized_lk import stable_var_batch
 
 
 def exact_lk_graph(x: torch.Tensor, *, n_step: int = 1, dt: float = 1.0):
-    """Exact OLS LK graph used solely as a post-training evaluation oracle."""
-    z = x[..., :-n_step]
-    y = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
-    z = z - z.mean(dim=-1, keepdim=True)
-    y = y - y.mean(dim=-1, keepdim=True)
-    m = z.shape[-1]
-    covariance = z @ z.transpose(1, 2) / (m - 1)
-    cross_covariance = z @ y.transpose(1, 2) / (m - 1)
-    try:
-        coefficients = torch.linalg.solve(covariance, cross_covariance)
-    except RuntimeError:
-        coefficients = torch.linalg.pinv(covariance) @ cross_covariance
-    ratio = exact_covariance_ratio(x, n_step=n_step, dt=dt)
-    return ratio * coefficients, coefficients, ratio
+    """Compatibility adapter for the graph-only exact LK estimation seam.
+
+    Keep the historical ``(graph, coefficients, covariance_ratio)`` tuple for
+    evaluation callers. CUDA half and bfloat16 windows are promoted before
+    preparation so all exact statistics and outputs use float32.
+    """
+    if x.device.type == "cuda" and x.dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
+    result = estimate_exact_graph(prepare_lk_statistics(x, n_step=n_step, dt=dt))
+    return result.graph, result.coefficients, result.covariance_ratio
 
 
 def rank_correlation(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
