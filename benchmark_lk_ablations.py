@@ -67,6 +67,19 @@ def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(((ra * rb).mean() / (ra.std(unbiased=False) * rb.std(unbiased=False)).clamp_min(1e-12)).item())
 
 
+def _h_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
+    """Measure H error and off-diagonal magnitude ordering."""
+    prediction, target = prediction.float(), target.float()
+    variables = prediction.shape[-1]
+    off_diagonal = ~torch.eye(variables, dtype=torch.bool, device=prediction.device)
+    return {
+        "h_mse": float((prediction - target).square().mean().item()),
+        "magnitude_rank_corr": _rank_corr(
+            prediction[..., off_diagonal].abs(), target[..., off_diagonal].abs()
+        ),
+    }
+
+
 def _metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
     prediction, target = prediction.float(), target.float()
     error = prediction - target
@@ -123,11 +136,13 @@ def _example_batch(
              [0, 0, 0, 0.2, 0, 0.7],
              [0, 0, 0, 0, 0, -0.5]],
             device=device,
-            dtype=torch.float32,
+            dtype=dtype,
         )
     else:
         raise ValueError(f"unknown example generator {kind!r}")
-    innovations = torch.randn(batch, length, p, device=device, generator=generator)
+    innovations = torch.randn(
+        batch, length, p, device=device, dtype=dtype, generator=generator
+    )
     states = torch.zeros_like(innovations)
     states[:, 0] = innovations[:, 0]
     for t in range(1, length):
@@ -279,6 +294,7 @@ def run(config_path: Path) -> tuple[Path, Path]:
         graph_time = _timing(lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
         for variant, model, train_seconds in fitted:
             peak = 0.0
+            h_timer = lambda: exact_covariance_ratio(evaluation, n_step=n_step, dt=dt)
             if variant["mode"] == "exact":
                 prediction, h_hat, timer = reference, h_reference, lambda: exact_estimator(exact_input)
             elif variant["mode"] == "exact_graph":
@@ -296,19 +312,23 @@ def run(config_path: Path) -> tuple[Path, Path]:
                 if runtime["compile"]: estimator = torch.compile(estimator, mode=runtime["compile_mode"])
                 with torch.no_grad(): prediction, _, h_hat = model(evaluation, projection=projection)
                 timer = lambda: estimator(evaluation, projection=projection)
+                h_timer = lambda: model.predict_covariance_ratio(evaluation, projection=projection)
+                if runtime["compile"]:
+                    h_timer = torch.compile(h_timer, mode=runtime["compile_mode"])
             if device.type == "cuda": torch.cuda.reset_peak_memory_stats(device)
             inference, wall = _timing(timer, runtime["timing_repeats"], runtime["warmup_repeats"], device)
+            h_inference, h_wall = _timing(h_timer, runtime["timing_repeats"], runtime["warmup_repeats"], device)
             if device.type == "cuda": peak = torch.cuda.max_memory_allocated(device) / 2**20
             metrics = _metrics(prediction, reference)
-            h_metrics = _metrics(h_hat, h_reference) if h_hat is not None else {"graph_mse": float("nan"), "magnitude_rank_corr": float("nan")}
-            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), **result_precision_metadata(runtime["dtype"], prediction), "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["graph_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
+            h_metrics = _h_metrics(h_hat, h_reference) if h_hat is not None else {"h_mse": float("nan"), "magnitude_rank_corr": float("nan")}
+            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), **result_precision_metadata(runtime["dtype"], prediction), "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "h_inference_seconds": h_inference, "h_inference_ms": h_inference * 1000, "h_inference_ms_wall": h_wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["h_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
             rows.append(row); print(f"measured {row['example']} / {row['variant']}: {row['inference_ms']:.3f}ms")
     csv_path = output_dir / "results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     markdown_path = output_dir / "results.md"
-    lines = ["# LK benchmark results", "", f"Device `{device}`, requested dtype `{runtime['dtype']}`.", "", "| Example | Variant | Inference (ms) | Speedup vs graph-only exact | Graph rank corr. | H MSE | Peak MB |", "|---|---|---:|---:|---:|---:|---:|"]
-    lines += [f"| {r['example']} | {r['variant']} | {r['inference_ms']:.3f} | {r['speedup_vs_exact_graph_only']:.2f}x | {r['magnitude_rank_corr']:.4f} | {r['h_mse']:.5g} | {r['peak_memory_mb']:.1f} |" for r in rows]
+    lines = ["# LK benchmark results", "", f"Device `{device}`, requested dtype `{runtime['dtype']}`.", "", "| Example | Variant | Inference (ms) | H inference (ms) | Speedup vs graph-only exact | Graph rank corr. | H MSE | Peak MB |", "|---|---|---:|---:|---:|---:|---:|---:|"]
+    lines += [f"| {r['example']} | {r['variant']} | {r['inference_ms']:.3f} | {r['h_inference_ms']:.3f} | {r['speedup_vs_exact_graph_only']:.2f}x | {r['magnitude_rank_corr']:.4f} | {r['h_mse']:.5g} | {r['peak_memory_mb']:.1f} |" for r in rows]
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, markdown_path
 

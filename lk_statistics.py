@@ -11,15 +11,17 @@ from torch import Tensor
 
 
 def _statistics_computation_tensor(x: Tensor) -> Tensor:
-    """Promote low-precision values before LK statistics are computed."""
+    """Promote low-precision values before LK sufficient statistics are computed."""
     if x.dtype in (torch.float16, torch.bfloat16):
         return x.to(dtype=torch.float32)
     return x
 
 
 @dataclass(frozen=True, eq=False)
-class LKStatistics:
-    """Prepared, centered LK state and derivative for a batch of windows.
+class LKSufficientStatistics:
+    """Prepared LK sufficient statistics with centered state and derivative.
+
+    Each instance describes one batch of windows.
 
     ``state`` and ``derivative`` have shape ``[batch, variables, samples]``.
     The state uses all but the final ``n_step`` observations. The derivative
@@ -48,17 +50,20 @@ class LKStatistics:
     @cached_property
     def covariance_ratio(self) -> Tensor:
         """Return ``H[i,j] = Cov(i,j) / Var(j)`` without cross-covariance."""
+        return self.covariance_ratio_with_epsilon(torch.finfo(self.state.dtype).eps)
+
+    def covariance_ratio_with_epsilon(self, eps: float) -> Tensor:
+        """Return H using a caller-selected denominator clamp."""
         # Scale back to the state Gram matrix to match the existing Torch
         # exact-H stabilization, which clamps its diagonal at dtype eps.
         gram = self.covariance * (self.state.shape[-1] - 1)
         diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
-        eps = torch.finfo(gram.dtype).eps
         return gram / diagonal.unsqueeze(-2).clamp_min(eps)
 
 
 def prepare_lk_statistics(
     x: Tensor, n_step: int = 1, dt: float = 1.0
-) -> LKStatistics:
+) -> LKSufficientStatistics:
     """Prepare centered state and derivative from ``[B, p, T]`` windows.
 
     ``n_step`` and ``dt`` follow the Torch LK estimators' forward-difference
@@ -79,9 +84,13 @@ def prepare_lk_statistics(
     derivative = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
     state = history - history.mean(dim=-1, keepdim=True)
     derivative = derivative - derivative.mean(dim=-1, keepdim=True)
-    return LKStatistics(
+    return LKSufficientStatistics(
         state=state,
         derivative=derivative,
         n_step=n_step,
         dt=float(dt),
     )
+
+
+# Backwards-compatible public name.
+LKStatistics = LKSufficientStatistics

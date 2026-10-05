@@ -27,11 +27,17 @@ class _MatrixFreeLKStatistics(LKStatistics):
 
 class _CovarianceOnlyLKStatistics(LKStatistics):
     covariance_reads = 0
+    covariance_ratio_reads = 0
 
     @property
     def covariance(self):
         type(self).covariance_reads += 1
         return super().covariance
+
+    @property
+    def covariance_ratio(self):
+        type(self).covariance_ratio_reads += 1
+        return super().covariance_ratio
 
     @property
     def cross_covariance(self):
@@ -107,9 +113,11 @@ class AmortizedLKTests(unittest.TestCase):
             prepared.state, prepared.derivative, prepared.n_step, prepared.dt
         )
         _CovarianceOnlyLKStatistics.covariance_reads = 0
+        _CovarianceOnlyLKStatistics.covariance_ratio_reads = 0
         exact_actual = exact_covariance_ratio(exact_statistics)
         self.assertTrue(torch.allclose(exact_actual, exact_expected, atol=1e-12, rtol=1e-12))
         self.assertEqual(_CovarianceOnlyLKStatistics.covariance_reads, 1)
+        self.assertEqual(_CovarianceOnlyLKStatistics.covariance_ratio_reads, 1)
 
         projected_expected = random_projection_covariance_ratio(
             self.x, rank=8, n_step=n_step, dt=dt, projection=projection
@@ -156,6 +164,22 @@ class AmortizedLKTests(unittest.TestCase):
             optimizer.step()
         exact = torch.linalg.solve(c, d)
         self.assertTrue(torch.allclose(learned, exact, atol=2e-3, rtol=2e-3))
+
+    def test_h_only_prediction_matches_forward_without_coefficients(self):
+        projection = torch.randn(64, self.x.shape[-1] - 1, dtype=self.x.dtype)
+        for method in ("exact", "projection", "learned_pair", "learned_low_rank"):
+            with self.subTest(method=method):
+                model = AmortizedLK(width=8, h_method=method, h_rank=3).double().eval()
+                with torch.no_grad():
+                    _, _, expected = model(self.x, projection=projection)
+                    with patch.object(
+                        model, "_coefficients", side_effect=AssertionError("W computed")
+                    ):
+                        actual = model.predict_covariance_ratio(
+                            self.x, projection=projection
+                        )
+
+                torch.testing.assert_close(actual, expected)
 
     def test_projection_h_matches_exact_when_full_rank_identity(self):
         identity = torch.eye(47, dtype=self.x.dtype)

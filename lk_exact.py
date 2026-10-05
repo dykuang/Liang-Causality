@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from lk_statistics import LKStatistics, _statistics_computation_tensor
+from lk_statistics import LKSufficientStatistics, _statistics_computation_tensor
 
 
 @dataclass(frozen=True, eq=False)
@@ -24,7 +24,7 @@ class ExactGraphResult:
     effective_dtype: torch.dtype
 
 
-def estimate_exact_graph(statistics: LKStatistics) -> ExactGraphResult:
+def estimate_exact_graph(statistics: LKSufficientStatistics) -> ExactGraphResult:
     """Estimate the exact LK graph from prepared sufficient statistics.
 
     The coefficient matrix is ``solve(C, D)`` and the graph is the
@@ -36,27 +36,27 @@ def estimate_exact_graph(statistics: LKStatistics) -> ExactGraphResult:
     Half and bfloat16 statistics are promoted to float32 before dense
     statistics are materialized. The result reports that effective dtype.
     """
-    if not isinstance(statistics, LKStatistics):
-        raise TypeError("statistics must be an LKStatistics value")
+    if not isinstance(statistics, LKSufficientStatistics):
+        raise TypeError("statistics must be an LKSufficientStatistics value")
 
     state = statistics.state
     derivative = statistics.derivative
     if not isinstance(state, Tensor) or not isinstance(derivative, Tensor):
-        raise TypeError("LK statistics state and derivative must be tensors")
+        raise TypeError("LK sufficient statistics state and derivative must be tensors")
     if state.ndim != 3 or derivative.shape != state.shape:
-        raise ValueError("LK statistics must have matching [batch, variables, samples] tensors")
+        raise ValueError("LK sufficient statistics must have matching [batch, variables, samples] tensors")
     if state.shape[-1] < 2:
         raise ValueError("at least two samples are required for exact LK estimation")
     if state.device != derivative.device or state.dtype != derivative.dtype:
-        raise ValueError("LK statistics state and derivative must share device and dtype")
+        raise ValueError("LK sufficient statistics state and derivative must share device and dtype")
     if not state.is_floating_point():
-        raise TypeError("LK statistics must use a floating-point dtype")
+        raise TypeError("LK sufficient statistics must use a floating-point dtype")
 
     state = _statistics_computation_tensor(state)
     derivative = _statistics_computation_tensor(derivative)
     effective_dtype = state.dtype
     if effective_dtype != statistics.state.dtype:
-        statistics = LKStatistics(
+        statistics = LKSufficientStatistics(
             state=state,
             derivative=derivative,
             n_step=statistics.n_step,

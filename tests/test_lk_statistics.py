@@ -4,10 +4,15 @@ from unittest.mock import patch
 
 import torch
 
-from lk_statistics import prepare_lk_statistics
+from lk_statistics import LKStatistics, LKSufficientStatistics, prepare_lk_statistics
 
 
 class LKStatisticsTests(unittest.TestCase):
+    def test_legacy_statistics_name_is_public_alias(self):
+        self.assertIs(LKStatistics, LKSufficientStatistics)
+        prepared = prepare_lk_statistics(torch.randn(1, 2, 8))
+        self.assertIsInstance(prepared, LKSufficientStatistics)
+
     def test_preparation_centers_state_and_finite_difference(self):
         x = torch.tensor(
             [[[0, 2, 4, 6, 10], [10, 8, 4, 2, 0]]], dtype=torch.float64

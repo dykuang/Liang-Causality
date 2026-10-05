@@ -7,6 +7,8 @@ import torch
 import yaml
 
 from benchmark_lk_ablations import (
+    _example_batch,
+    _h_metrics,
     result_precision_metadata,
     run,
     validate_config,
@@ -24,6 +26,19 @@ class BenchmarkConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "mixed precision is supported only on CUDA"):
             validate_config(config)
 
+    def test_example_batch_honors_requested_dtype_for_all_families(self):
+        for generator_name, variables in (("oscillator", 2), ("repository6d", 6)):
+            with self.subTest(generator=generator_name):
+                batch = _example_batch(
+                    {"generator": generator_name, "variables": variables, "time": 12},
+                    2,
+                    device=torch.device("cpu"),
+                    generator=torch.Generator().manual_seed(7),
+                    dtype=torch.float64,
+                )
+
+                self.assertEqual(batch.dtype, torch.float64)
+
     def test_validation_resolves_requested_dtype_without_losing_runtime_config(self):
         config = {
             "runtime": {"device": "cpu", "dtype": "float32"},
@@ -38,6 +53,17 @@ class BenchmarkConfigTests(unittest.TestCase):
 
 
 class BenchmarkResultTests(unittest.TestCase):
+    def test_h_magnitude_rank_correlation_ignores_diagonal(self):
+        target = torch.tensor([[[1.0, 0.2, 0.4], [0.3, 1.0, 0.5], [0.6, 0.7, 1.0]]])
+        prediction = target.clone()
+        baseline = _h_metrics(prediction, target)["magnitude_rank_corr"]
+        prediction.diagonal(dim1=-2, dim2=-1).copy_(torch.tensor([[100.0, -80.0, 60.0]]))
+
+        changed_diagonal = _h_metrics(prediction, target)["magnitude_rank_corr"]
+
+        self.assertEqual(baseline, 1.0)
+        self.assertEqual(changed_diagonal, baseline)
+
     def test_precision_metadata_uses_computed_dtype_for_each_variant_kind(self):
         exact = result_precision_metadata(
             "bfloat16", torch.zeros((), dtype=torch.float32)
@@ -108,6 +134,12 @@ class BenchmarkResultTests(unittest.TestCase):
                 first_rows = list(csv.DictReader(handle))
             copied_config = output_dir / "config.yaml"
             self.assertEqual(copied_config.read_bytes(), source_config.read_bytes())
+            self.assertTrue(all(float(row["h_inference_ms"]) >= 0 for row in first_rows))
+            self.assertTrue(all(float(row["h_inference_ms_wall"]) >= 0 for row in first_rows))
+            markdown = (output_dir / "results.md").read_text(encoding="utf-8")
+            self.assertIn("H inference (ms)", markdown)
+            markdown_lines = markdown.splitlines()
+            self.assertEqual(markdown_lines[4].count("|"), markdown_lines[5].count("|"))
             self.assertEqual(
                 [(row["variant"], row["requested_dtype"], row["effective_dtype"]) for row in first_rows],
                 [
@@ -125,6 +157,9 @@ class BenchmarkResultTests(unittest.TestCase):
                 "inference_seconds",
                 "inference_ms",
                 "inference_ms_wall",
+                "h_inference_seconds",
+                "h_inference_ms",
+                "h_inference_ms_wall",
                 "speedup_vs_exact_lk",
                 "speedup_vs_exact_graph_only",
             }

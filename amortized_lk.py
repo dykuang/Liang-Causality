@@ -18,20 +18,22 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from lk_statistics import LKStatistics, prepare_lk_statistics
+from lk_statistics import LKSufficientStatistics, prepare_lk_statistics
 
 
-LKInput = Tensor | LKStatistics
+LKInput = Tensor | LKSufficientStatistics
 
 
-def _as_lk_statistics(x: LKInput, n_step: int, dt: float) -> LKStatistics:
+def _as_lk_sufficient_statistics(
+    x: LKInput, n_step: int, dt: float
+) -> LKSufficientStatistics:
     """Reuse prepared statistics or prepare a raw window.
 
     ``n_step`` and ``dt`` apply only when ``x`` is a raw window. An
-    ``LKStatistics`` input is reused as-is and retains its own ``n_step`` and
+    ``LKSufficientStatistics`` input is reused as-is and retains its own ``n_step`` and
     ``dt``.
     """
-    if isinstance(x, LKStatistics):
+    if isinstance(x, LKSufficientStatistics):
         return x
     return prepare_lk_statistics(x, n_step=n_step, dt=dt)
 
@@ -42,10 +44,10 @@ def _state_and_derivative(
     """Return centered state and differences as ``[B,p,m]``.
 
     ``n_step`` and ``dt`` configure preparation for a raw window. If ``x`` is
-    an ``LKStatistics`` input, its prepared state and derivative are reused
+    an ``LKSufficientStatistics`` input, its prepared state and derivative are reused
     unchanged with its own ``n_step`` and ``dt``.
     """
-    statistics = _as_lk_statistics(x, n_step, dt)
+    statistics = _as_lk_sufficient_statistics(x, n_step, dt)
     return statistics.state, statistics.derivative
 
 
@@ -76,7 +78,7 @@ def stochastic_probe_residual_loss(
     products are with the window-shaped state and derivative arrays.
 
     ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
-    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    An ``LKSufficientStatistics`` input is reused as-is with its own ``n_step`` and
     ``dt``.
     """
     if q < 1:
@@ -156,7 +158,7 @@ def random_projection_covariance_ratio(
     Gaussian projection is drawn on each call. The output is ``[B,p,p]``.
 
     ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
-    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    An ``LKSufficientStatistics`` input is reused as-is with its own ``n_step`` and
     ``dt``.
     """
     if rank < 1:
@@ -185,16 +187,29 @@ def exact_covariance_ratio(
     """Compute the exact sample ``H`` ratio for evaluation-only H0 baselines.
 
     ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
-    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    An ``LKSufficientStatistics`` input is reused as-is with its own ``n_step`` and
     ``dt``.
     """
-    statistics = _as_lk_statistics(x, n_step, dt)
-    # Exact H only needs state covariance. Leave cross-covariance lazy.
-    gram = statistics.covariance * (statistics.state.shape[-1] - 1)
-    diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+    statistics = _as_lk_sufficient_statistics(x, n_step, dt)
     if eps is None:
-        eps = torch.finfo(statistics.state.dtype).eps
-    return gram / diagonal.unsqueeze(-2).clamp_min(eps)
+        return statistics.covariance_ratio
+    return statistics.covariance_ratio_with_epsilon(eps)
+
+
+def _sampled_covariance_ratio_targets(
+    statistics: LKSufficientStatistics, pairs: Tensor, eps: Optional[float]
+) -> tuple[Tensor, Tensor]:
+    """Return selected H targets and normalized pair indices."""
+    if pairs.ndim != 2 or pairs.shape[1] != 2:
+        raise ValueError("pairs must have shape [num_pairs, 2]")
+    z = statistics.state
+    pairs = pairs.to(device=z.device, dtype=torch.long)
+    i, j = pairs.unbind(dim=1)
+    numerator = (z[:, i] * z[:, j]).sum(dim=-1)
+    denominator = z[:, j].square().sum(dim=-1)
+    if eps is None:
+        eps = torch.finfo(z.dtype).eps
+    return numerator / denominator.clamp_min(eps), pairs
 
 
 def sampled_covariance_ratio_loss(
@@ -204,22 +219,15 @@ def sampled_covariance_ratio_loss(
     """Supervise selected H[i,j] ratios without an LK label or full H.
 
     ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
-    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
-    ``dt``.
+    An ``LKSufficientStatistics`` input is reused as-is with its own ``n_step``
+    and ``dt``.
     """
-    z, _ = _state_and_derivative(x, n_step, dt)
-    batch, variables, _ = z.shape
-    if pairs.ndim != 2 or pairs.shape[1] != 2:
-        raise ValueError("pairs must have shape [num_pairs, 2]")
+    statistics = _as_lk_sufficient_statistics(x, n_step, dt)
+    batch, variables, _ = statistics.state.shape
     if h_hat.shape != (batch, variables, variables):
         raise ValueError("h_hat must have shape [batch, variables, variables]")
-    pairs = pairs.to(device=z.device, dtype=torch.long)
+    target, pairs = _sampled_covariance_ratio_targets(statistics, pairs, eps)
     i, j = pairs.unbind(dim=1)
-    numerator = (z[:, i] * z[:, j]).sum(dim=-1)
-    denominator = z[:, j].square().sum(dim=-1)
-    if eps is None:
-        eps = torch.finfo(z.dtype).eps
-    target = numerator / denominator.clamp_min(eps)
     prediction = h_hat[:, i, j]
     return (prediction - target).square().mean()
 
@@ -231,21 +239,13 @@ def sampled_covariance_ratio_pair_loss(
     """Supervise selected covariance ratios without materializing full H.
 
     ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
-    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
-    ``dt``.
+    An ``LKSufficientStatistics`` input is reused as-is with its own ``n_step``
+    and ``dt``.
     """
-    z, _ = _state_and_derivative(x, n_step, dt)
-    if pairs.ndim != 2 or pairs.shape[1] != 2:
-        raise ValueError("pairs must have shape [num_pairs, 2]")
-    if h_pairs.shape != (z.shape[0], pairs.shape[0]):
+    statistics = _as_lk_sufficient_statistics(x, n_step, dt)
+    target, _ = _sampled_covariance_ratio_targets(statistics, pairs, eps)
+    if h_pairs.shape != (statistics.state.shape[0], target.shape[1]):
         raise ValueError("h_pairs must have shape [batch, num_pairs]")
-    pairs = pairs.to(device=z.device, dtype=torch.long)
-    i, j = pairs.unbind(dim=1)
-    numerator = (z[:, i] * z[:, j]).sum(dim=-1)
-    denominator = z[:, j].square().sum(dim=-1)
-    if eps is None:
-        eps = torch.finfo(z.dtype).eps
-    target = numerator / denominator.clamp_min(eps)
     return (h_pairs - target).square().mean()
 
 
@@ -479,15 +479,22 @@ class AmortizedLK(nn.Module):
         context = self.global_rho(self.global_phi(h).mean(dim=1)) if self.use_global_context else torch.zeros_like(h.mean(dim=1))
         return h, context, signed_scales.squeeze(-1), centered
 
+    def _pair_features(
+        self, h: Tensor, context: Tensor,
+        source: Optional[Tensor] = None, target: Optional[Tensor] = None,
+    ) -> Tensor:
+        variables = h.shape[1]
+        source = source if source is not None else h.unsqueeze(2).expand(-1, -1, variables, -1)
+        target = target if target is not None else h.unsqueeze(1).expand(-1, variables, -1, -1)
+        global_edges = context[:, None, None, :].expand(-1, variables, variables, -1)
+        return torch.cat((source, target, source * target, source - target, global_edges), dim=-1)
+
     def _coefficients(self, h: Tensor, context: Tensor, scales: Tensor) -> tuple[Tensor, Optional[Tensor]]:
         variables = h.shape[1]
-        needs_pair = self.decoder_type in {"pair_mlp", "bilinear_residual"} or self.h_method == "learned_pair"
         source = h.unsqueeze(2).expand(-1, -1, variables, -1)
         target = h.unsqueeze(1).expand(-1, variables, -1, -1)
-        pair_features = None
-        if needs_pair:
-            global_edges = context[:, None, None, :].expand(-1, variables, variables, -1)
-            pair_features = torch.cat((source, target, source * target, source - target, global_edges), dim=-1)
+        needs_pair = self.decoder_type in {"pair_mlp", "bilinear_residual"} or self.h_method == "learned_pair"
+        pair_features = self._pair_features(h, context, source, target) if needs_pair else None
         if self.decoder_type == "pair_mlp":
             w_normalized = self.edge_decoder(pair_features).squeeze(-1)
         elif self.decoder_type == "bilinear":
@@ -502,6 +509,30 @@ class AmortizedLK(nn.Module):
         """Predict W only, avoiding all covariance-ratio work."""
         h, context, scales, _ = self._features(x)
         return self._coefficients(h, context, scales)[0]
+
+    def predict_covariance_ratio(
+        self,
+        x: Tensor,
+        *,
+        projection: Optional[Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tensor:
+        """Predict H alone without running the coefficient decoder for W."""
+        if self.h_method == "exact":
+            return exact_covariance_ratio(x, n_step=self.n_step, dt=self.dt)
+        if self.h_method == "projection":
+            return random_projection_covariance_ratio(
+                x, rank=self.projection_rank, n_step=self.n_step, dt=self.dt,
+                projection=projection, generator=generator,
+            )
+
+        h, context, scales, _ = self._features(x)
+        if self.h_method == "learned_pair":
+            return self.h_decoder(self._pair_features(h, context)).squeeze(-1)
+        factors = self.low_rank_h_head.factors(h, context)
+        return self.low_rank_h_head.materialize(
+            factors, scales, torch.finfo(x.dtype).eps
+        )
 
     def score_h_pairs(self, x: Tensor, pairs: Tensor) -> Tensor:
         """Score selected H pairs without materializing the dense H matrix."""
