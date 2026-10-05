@@ -12,6 +12,30 @@ from amortized_lk import (
     stochastic_probe_residual_loss,
 )
 from lk_estimators import LKEstimator
+from lk_statistics import LKStatistics, prepare_lk_statistics
+
+
+class _MatrixFreeLKStatistics(LKStatistics):
+    @property
+    def covariance(self):
+        raise AssertionError("matrix-free helper requested covariance")
+
+    @property
+    def cross_covariance(self):
+        raise AssertionError("matrix-free helper requested cross-covariance")
+
+
+class _CovarianceOnlyLKStatistics(LKStatistics):
+    covariance_reads = 0
+
+    @property
+    def covariance(self):
+        type(self).covariance_reads += 1
+        return super().covariance
+
+    @property
+    def cross_covariance(self):
+        raise AssertionError("exact H requested cross-covariance")
 
 
 class AmortizedLKTests(unittest.TestCase):
@@ -45,6 +69,73 @@ class AmortizedLKTests(unittest.TestCase):
             loss.backward()
         self.assertIsNotNone(model.edge_decoder[0].weight.grad)
         self.assertGreater(float(model.edge_decoder[0].weight.grad.norm()), 0.0)
+
+    def test_prepared_statistics_feed_matrix_free_probe_loss(self):
+        n_step, dt = 2, 0.5
+        devices = [self.x.device]
+        if torch.cuda.is_available():
+            devices.append(torch.device("cuda"))
+        for device in devices:
+            with self.subTest(device=device):
+                x = self.x.to(device)
+                prepared = prepare_lk_statistics(x, n_step=n_step, dt=dt)
+                statistics = _MatrixFreeLKStatistics(
+                    prepared.state, prepared.derivative, prepared.n_step, prepared.dt
+                )
+                w = torch.randn(3, 4, 4, dtype=x.dtype, device=device)
+                raw_generator = torch.Generator(device=device).manual_seed(19)
+                statistics_generator = torch.Generator(device=device).manual_seed(19)
+
+                expected = stochastic_probe_residual_loss(
+                    x, w, q=3, n_step=n_step, dt=dt, generator=raw_generator
+                )
+                actual = stochastic_probe_residual_loss(
+                    statistics, w, q=3, generator=statistics_generator
+                )
+
+                self.assertTrue(torch.allclose(actual, expected, atol=1e-12, rtol=1e-12))
+
+    def test_covariance_ratio_helpers_accept_prepared_statistics(self):
+        n_step, dt = 2, 0.5
+        prepared = prepare_lk_statistics(self.x, n_step=n_step, dt=dt)
+        matrix_free_statistics = _MatrixFreeLKStatistics(
+            prepared.state, prepared.derivative, prepared.n_step, prepared.dt
+        )
+        projection = torch.randn(8, prepared.state.shape[-1], dtype=self.x.dtype)
+        exact_expected = exact_covariance_ratio(self.x, n_step=n_step, dt=dt)
+        exact_statistics = _CovarianceOnlyLKStatistics(
+            prepared.state, prepared.derivative, prepared.n_step, prepared.dt
+        )
+        _CovarianceOnlyLKStatistics.covariance_reads = 0
+        exact_actual = exact_covariance_ratio(exact_statistics)
+        self.assertTrue(torch.allclose(exact_actual, exact_expected, atol=1e-12, rtol=1e-12))
+        self.assertEqual(_CovarianceOnlyLKStatistics.covariance_reads, 1)
+
+        projected_expected = random_projection_covariance_ratio(
+            self.x, rank=8, n_step=n_step, dt=dt, projection=projection
+        )
+        projected_actual = random_projection_covariance_ratio(
+            matrix_free_statistics, rank=8, projection=projection
+        )
+        self.assertTrue(torch.allclose(projected_actual, projected_expected, atol=1e-12, rtol=1e-12))
+
+        pairs = torch.tensor([[0, 1], [2, 3], [1, 1]])
+        h_hat = torch.randn(3, 4, 4, dtype=self.x.dtype)
+        h_pairs = torch.randn(3, pairs.shape[0], dtype=self.x.dtype)
+        sampled_expected = sampled_covariance_ratio_loss(
+            self.x, h_hat, pairs, n_step=n_step, dt=dt
+        )
+        sampled_actual = sampled_covariance_ratio_loss(
+            matrix_free_statistics, h_hat, pairs
+        )
+        self.assertTrue(torch.allclose(sampled_actual, sampled_expected, atol=1e-12, rtol=1e-12))
+        pair_expected = sampled_covariance_ratio_pair_loss(
+            self.x, h_pairs, pairs, n_step=n_step, dt=dt
+        )
+        pair_actual = sampled_covariance_ratio_pair_loss(
+            matrix_free_statistics, h_pairs, pairs
+        )
+        self.assertTrue(torch.allclose(pair_actual, pair_expected, atol=1e-12, rtol=1e-12))
 
     def test_free_matrix_residual_identifies_ols_coefficients(self):
         x = self.x[:1]

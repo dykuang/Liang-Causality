@@ -18,28 +18,29 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from lk_statistics import LKStatistics, prepare_lk_statistics
+
+
+LKInput = Tensor | LKStatistics
+
+
+def _as_lk_statistics(x: LKInput, n_step: int, dt: float) -> LKStatistics:
+    """Use prepared statistics directly or prepare them from a raw window."""
+    if isinstance(x, LKStatistics):
+        return x
+    return prepare_lk_statistics(x, n_step=n_step, dt=dt)
 
 
 def _state_and_derivative(
-    x: Tensor, n_step: int, dt: float
+    x: LKInput, n_step: int, dt: float
 ) -> tuple[Tensor, Tensor]:
     """Return centered state and finite-difference matrices as ``[B,p,m]``."""
-    if x.ndim != 3:
-        raise ValueError("x must have shape [batch, variables, time]")
-    if n_step < 1 or x.shape[-1] <= n_step + 1:
-        raise ValueError("time dimension must be greater than n_step + 1")
-    if dt <= 0:
-        raise ValueError("dt must be positive")
-
-    z = x[..., :-n_step]
-    y = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
-    z = z - z.mean(dim=-1, keepdim=True)
-    y = y - y.mean(dim=-1, keepdim=True)
-    return z, y
+    statistics = _as_lk_statistics(x, n_step, dt)
+    return statistics.state, statistics.derivative
 
 
 def stochastic_probe_residual_loss(
-    x: Tensor,
+    x: LKInput,
     w_hat: Tensor,
     *,
     q: int = 4,
@@ -70,6 +71,7 @@ def stochastic_probe_residual_loss(
     batch, variables, m = z.shape
     if w_hat.shape != (batch, variables, variables):
         raise ValueError("w_hat must have shape [batch, variables, variables]")
+    w_hat = w_hat.to(dtype=z.dtype)
 
     if ridge is None:
         # tr(C)/p from the sample variance diagonal, without forming C.
@@ -82,18 +84,18 @@ def stochastic_probe_residual_loss(
 
     if probe_distribution == "rademacher":
         probes = torch.empty(
-            batch, variables, q, device=x.device, dtype=x.dtype
+            batch, variables, q, device=z.device, dtype=z.dtype
         ).bernoulli_(0.5, generator=generator).mul_(2).sub_(1)
     elif probe_distribution == "gaussian":
         probes = torch.randn(
-            batch, variables, q, device=x.device, dtype=x.dtype,
+            batch, variables, q, device=z.device, dtype=z.dtype,
             generator=generator,
         )
     elif probe_distribution == "orthogonal":
         if q > variables:
             raise ValueError("orthogonal probes require q <= number of variables")
         gaussian = torch.randn(
-            batch, variables, q, device=x.device, dtype=x.dtype,
+            batch, variables, q, device=z.device, dtype=z.dtype,
             generator=generator,
         )
         probes = torch.linalg.qr(gaussian, mode="reduced").Q * math.sqrt(variables)
@@ -110,12 +112,12 @@ def stochastic_probe_residual_loss(
     mode = loss_mode or ("normalized" if normalized else "plain")
     if mode == "normalized":
         dv = z @ (y.transpose(1, 2) @ probes) / (m - 1)
-        scale = dv.square().sum(dim=1).clamp_min(torch.finfo(x.dtype).eps)
+        scale = dv.square().sum(dim=1).clamp_min(torch.finfo(z.dtype).eps)
         probe_loss = probe_loss / scale
     elif mode == "jacobi":
         diagonal = z.square().sum(dim=-1) / (m - 1)
         preconditioner = (diagonal + lam[:, None]).clamp_min(
-            torch.finfo(x.dtype).eps
+            torch.finfo(z.dtype).eps
         ).rsqrt()
         probe_loss = (residual_samples * preconditioner.unsqueeze(-1)).square().sum(dim=1)
     elif mode != "plain":
@@ -124,7 +126,7 @@ def stochastic_probe_residual_loss(
 
 
 def random_projection_covariance_ratio(
-    x: Tensor,
+    x: LKInput,
     *,
     rank: int = 64,
     n_step: int = 1,
@@ -145,34 +147,35 @@ def random_projection_covariance_ratio(
     batch, variables, m = z.shape
     if projection is None:
         projection = torch.randn(
-            rank, m, dtype=x.dtype, device=x.device, generator=generator
+            rank, m, dtype=z.dtype, device=z.device, generator=generator
         ) / math.sqrt(rank)
     else:
         if projection.shape != (rank, m):
             raise ValueError("projection must have shape [rank, time-n_step]")
-        projection = projection.to(device=x.device, dtype=x.dtype)
+        projection = projection.to(device=z.device, dtype=z.dtype)
     sketch = z @ projection.transpose(0, 1)
     gram = sketch @ sketch.transpose(1, 2)
     diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
     if eps is None:
-        eps = torch.finfo(x.dtype).eps
+        eps = torch.finfo(z.dtype).eps
     return gram / diagonal.unsqueeze(-2).clamp_min(eps)
 
 
 def exact_covariance_ratio(
-    x: Tensor, *, n_step: int = 1, dt: float = 1.0, eps: Optional[float] = None
+    x: LKInput, *, n_step: int = 1, dt: float = 1.0, eps: Optional[float] = None
 ) -> Tensor:
     """Compute the exact sample ``H`` ratio for evaluation-only H0 baselines."""
-    z, _ = _state_and_derivative(x, n_step, dt)
-    gram = z @ z.transpose(1, 2)
+    statistics = _as_lk_statistics(x, n_step, dt)
+    # Exact H only needs state covariance. Leave cross-covariance lazy.
+    gram = statistics.covariance * (statistics.state.shape[-1] - 1)
     diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
     if eps is None:
-        eps = torch.finfo(x.dtype).eps
+        eps = torch.finfo(statistics.state.dtype).eps
     return gram / diagonal.unsqueeze(-2).clamp_min(eps)
 
 
 def sampled_covariance_ratio_loss(
-    x: Tensor, h_hat: Tensor, pairs: Tensor, *, n_step: int = 1,
+    x: LKInput, h_hat: Tensor, pairs: Tensor, *, n_step: int = 1,
     dt: float = 1.0, eps: Optional[float] = None,
 ) -> Tensor:
     """Supervise selected H[i,j] ratios directly, without an LK label or full H."""
@@ -182,19 +185,19 @@ def sampled_covariance_ratio_loss(
         raise ValueError("pairs must have shape [num_pairs, 2]")
     if h_hat.shape != (batch, variables, variables):
         raise ValueError("h_hat must have shape [batch, variables, variables]")
-    pairs = pairs.to(device=x.device, dtype=torch.long)
+    pairs = pairs.to(device=z.device, dtype=torch.long)
     i, j = pairs.unbind(dim=1)
     numerator = (z[:, i] * z[:, j]).sum(dim=-1)
     denominator = z[:, j].square().sum(dim=-1)
     if eps is None:
-        eps = torch.finfo(x.dtype).eps
+        eps = torch.finfo(z.dtype).eps
     target = numerator / denominator.clamp_min(eps)
     prediction = h_hat[:, i, j]
     return (prediction - target).square().mean()
 
 
 def sampled_covariance_ratio_pair_loss(
-    x: Tensor, h_pairs: Tensor, pairs: Tensor, *, n_step: int = 1,
+    x: LKInput, h_pairs: Tensor, pairs: Tensor, *, n_step: int = 1,
     dt: float = 1.0, eps: Optional[float] = None,
 ) -> Tensor:
     """Supervise selected covariance ratios without materializing full H."""
@@ -203,12 +206,12 @@ def sampled_covariance_ratio_pair_loss(
         raise ValueError("pairs must have shape [num_pairs, 2]")
     if h_pairs.shape != (z.shape[0], pairs.shape[0]):
         raise ValueError("h_pairs must have shape [batch, num_pairs]")
-    pairs = pairs.to(device=x.device, dtype=torch.long)
+    pairs = pairs.to(device=z.device, dtype=torch.long)
     i, j = pairs.unbind(dim=1)
     numerator = (z[:, i] * z[:, j]).sum(dim=-1)
     denominator = z[:, j].square().sum(dim=-1)
     if eps is None:
-        eps = torch.finfo(x.dtype).eps
+        eps = torch.finfo(z.dtype).eps
     target = numerator / denominator.clamp_min(eps)
     return (h_pairs - target).square().mean()
 
