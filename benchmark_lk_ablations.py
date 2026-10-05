@@ -8,6 +8,7 @@ import shutil
 import statistics
 import time
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -59,17 +60,39 @@ def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:
     return float(((ra * rb).mean() / (ra.std(unbiased=False) * rb.std(unbiased=False)).clamp_min(1e-12)).item())
 
 
-def _h_metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
-    """Measure H error and off-diagonal magnitude ordering."""
+def _h_metrics(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    rho_prediction: Optional[torch.Tensor] = None,
+) -> dict[str, object]:
+    """Measure H accuracy and optional low-rank correlation structure."""
     prediction, target = prediction.float(), target.float()
     variables = prediction.shape[-1]
     off_diagonal = ~torch.eye(variables, dtype=torch.bool, device=prediction.device)
-    return {
+    metrics: dict[str, object] = {
         "h_mse": float((prediction - target).square().mean().item()),
         "magnitude_rank_corr": _rank_corr(
             prediction[..., off_diagonal].abs(), target[..., off_diagonal].abs()
         ),
+        "rho_symmetry_error": "",
+        "rho_diag_error": "",
     }
+    if rho_prediction is not None:
+        rho_prediction = rho_prediction.float()
+        symmetry_error = (
+            rho_prediction - rho_prediction.transpose(-1, -2)
+        ).abs().amax()
+        diagonal_error = (
+            torch.diagonal(rho_prediction, dim1=-2, dim2=-1) - 1
+        ).abs().amax()
+        metrics["rho_symmetry_error"] = float(symmetry_error.item())
+        metrics["rho_diag_error"] = float(diagonal_error.item())
+    return metrics
+
+
+def _format_optional_metric(value: object) -> str:
+    return "NA" if value == "" else f"{float(value):.3g}"
 
 
 def _metrics(prediction: torch.Tensor, target: torch.Tensor) -> dict[str, float]:
@@ -290,6 +313,7 @@ def run(config_path: Path) -> tuple[Path, Path]:
         graph_time = _timing(lambda: exact_lk_graph(exact_input, n_step=n_step, dt=dt), runtime["timing_repeats"], runtime["warmup_repeats"], device)[0]
         for variant, model, train_seconds in fitted:
             peak = 0.0
+            rho_hat = None
             h_timer = lambda: exact_covariance_ratio(evaluation, n_step=n_step, dt=dt)
             if variant["mode"] == "exact":
                 prediction, h_hat, timer = reference, h_reference, lambda: exact_estimator(exact_input)
@@ -306,7 +330,13 @@ def run(config_path: Path) -> tuple[Path, Path]:
                     projection = torch.randn(rank, example["time"] - n_step, device=device, dtype=dtype, generator=torch.Generator(device=device).manual_seed(seed + 9)) / rank**0.5
                 estimator = LKEstimator(mode="amortized", amortized_model=model).to(device).eval()
                 if runtime["compile"]: estimator = torch.compile(estimator, mode=runtime["compile_mode"])
-                with torch.no_grad(): prediction, _, h_hat = model(evaluation, projection=projection)
+                with torch.no_grad():
+                    prediction, _, h_hat = model(evaluation, projection=projection)
+                    rho_hat = (
+                        model.predict_h_correlation(evaluation)
+                        if model.h_method == "learned_low_rank"
+                        else None
+                    )
                 timer = lambda: estimator(evaluation, projection=projection)
                 h_timer = lambda: model.predict_covariance_ratio(evaluation, projection=projection)
                 if runtime["compile"]:
@@ -316,15 +346,24 @@ def run(config_path: Path) -> tuple[Path, Path]:
             h_inference, h_wall = _timing(h_timer, runtime["timing_repeats"], runtime["warmup_repeats"], device)
             if device.type == "cuda": peak = torch.cuda.max_memory_allocated(device) / 2**20
             metrics = _metrics(prediction, reference)
-            h_metrics = _h_metrics(h_hat, h_reference) if h_hat is not None else {"h_mse": float("nan"), "magnitude_rank_corr": float("nan")}
-            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), **result_precision_metadata(runtime["dtype"], prediction), "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "h_inference_seconds": h_inference, "h_inference_ms": h_inference * 1000, "h_inference_ms_wall": h_wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["h_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"]}
+            h_metrics = (
+                _h_metrics(h_hat, h_reference, rho_prediction=rho_hat)
+                if h_hat is not None
+                else {
+                    "h_mse": float("nan"),
+                    "magnitude_rank_corr": float("nan"),
+                    "rho_symmetry_error": "",
+                    "rho_diag_error": "",
+                }
+            )
+            row = {"example": example["name"], "variables": example["variables"], "time": example["time"], "eval_batch_size": evaluation.shape[0], "variant": variant["name"], "mode": variant["mode"], "encoder_type": variant.get("encoder_type", ""), "decoder_type": variant.get("decoder_type", ""), "h_method": getattr(model, "h_method", "exact") if model else "exact", "low_rank": variant.get("low_rank", ""), "h_rank": variant.get("h_rank", ""), "projection_rank": variant.get("projection_rank", ""), "device": str(device), **result_precision_metadata(runtime["dtype"], prediction), "compiled": runtime["compile"] and variant["mode"] == "amortized", "compile_mode": runtime["compile_mode"], "train_seconds": train_seconds, "inference_seconds": inference, "inference_ms": inference * 1000, "inference_ms_wall": wall * 1000, "h_inference_seconds": h_inference, "h_inference_ms": h_inference * 1000, "h_inference_ms_wall": h_wall * 1000, "peak_memory_mb": peak, "speedup_vs_exact_lk": exact_time / max(inference, 1e-12), "speedup_vs_exact_graph_only": graph_time / max(inference, 1e-12), **metrics, "h_mse": h_metrics["h_mse"], "h_magnitude_rank_corr": h_metrics["magnitude_rank_corr"], "rho_symmetry_error": h_metrics["rho_symmetry_error"], "rho_diag_error": h_metrics["rho_diag_error"]}
             rows.append(row); print(f"measured {row['example']} / {row['variant']}: {row['inference_ms']:.3f}ms")
     csv_path = output_dir / "results.csv"
     with csv_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
     markdown_path = output_dir / "results.md"
-    lines = ["# LK benchmark results", "", f"Device `{device}`, requested dtype `{runtime['dtype']}`.", "", "| Example | Variant | Inference (ms) | H inference (ms) | Speedup vs graph-only exact | Graph rank corr. | H MSE | Peak MB |", "|---|---|---:|---:|---:|---:|---:|---:|"]
-    lines += [f"| {r['example']} | {r['variant']} | {r['inference_ms']:.3f} | {r['h_inference_ms']:.3f} | {r['speedup_vs_exact_graph_only']:.2f}x | {r['magnitude_rank_corr']:.4f} | {r['h_mse']:.5g} | {r['peak_memory_mb']:.1f} |" for r in rows]
+    lines = ["# LK benchmark results", "", f"Device `{device}`, requested dtype `{runtime['dtype']}`.", "", "| Example | Variant | Inference (ms) | H inference (ms) | Speedup vs graph-only exact | Graph rank corr. | H MSE | ρ symmetry err. | ρ diagonal err. | Peak MB |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines += [f"| {r['example']} | {r['variant']} | {r['inference_ms']:.3f} | {r['h_inference_ms']:.3f} | {r['speedup_vs_exact_graph_only']:.2f}x | {r['magnitude_rank_corr']:.4f} | {r['h_mse']:.5g} | {_format_optional_metric(r['rho_symmetry_error'])} | {_format_optional_metric(r['rho_diag_error'])} | {r['peak_memory_mb']:.1f} |" for r in rows]
     markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return csv_path, markdown_path
 

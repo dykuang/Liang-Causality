@@ -98,6 +98,18 @@ class BenchmarkResultTests(unittest.TestCase):
         self.assertEqual(baseline, 1.0)
         self.assertEqual(changed_diagonal, baseline)
 
+    def test_h_metrics_records_low_rank_correlation_structure_errors(self):
+        h = torch.tensor([[[1.0, 0.2], [0.2, 1.0]]])
+        rho = h.clone()
+
+        metrics = _h_metrics(h, h, rho_prediction=rho)
+        not_applicable = _h_metrics(h, h)
+
+        self.assertEqual(metrics["rho_symmetry_error"], 0.0)
+        self.assertEqual(metrics["rho_diag_error"], 0.0)
+        self.assertEqual(not_applicable["rho_symmetry_error"], "")
+        self.assertEqual(not_applicable["rho_diag_error"], "")
+
     def test_precision_metadata_uses_computed_dtype_for_each_variant_kind(self):
         exact = result_precision_metadata(
             "bfloat16", torch.zeros((), dtype=torch.float32)
@@ -207,6 +219,15 @@ class BenchmarkResultTests(unittest.TestCase):
                         "low_rank": 2,
                         "h_method": "exact",
                     },
+                    {
+                        "name": "amortized_low_rank_h",
+                        "mode": "amortized",
+                        "encoder_type": "downsample_mlp",
+                        "decoder_type": "low_rank",
+                        "low_rank": 2,
+                        "h_method": "learned_low_rank",
+                        "h_rank": 2,
+                    },
                 ],
             }
             source_config.write_text(yaml.safe_dump(config), encoding="utf-8")
@@ -229,6 +250,7 @@ class BenchmarkResultTests(unittest.TestCase):
                     ("exact_graph_only", "float32", "float32"),
                     ("amortized_exact_h", "float32", "float32"),
                     ("amortized_exact_h_same_arch", "float32", "float32"),
+                    ("amortized_low_rank_h", "float32", "float32"),
                 ],
             )
             shared_seed_metrics = (
@@ -238,6 +260,9 @@ class BenchmarkResultTests(unittest.TestCase):
             )
             for metric in shared_seed_metrics:
                 self.assertEqual(first_rows[1][metric], first_rows[2][metric], metric)
+            self.assertEqual(first_rows[0]["rho_symmetry_error"], "")
+            self.assertLess(float(first_rows[3]["rho_symmetry_error"]), 1e-5)
+            self.assertLess(float(first_rows[3]["rho_diag_error"]), 1e-5)
 
             reproduced_csv_path, _ = run(copied_config)
             with reproduced_csv_path.open(newline="", encoding="utf-8") as handle:

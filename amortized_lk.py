@@ -393,22 +393,44 @@ class LowRankCorrelationHead(nn.Module):
         return numerator / denominator
 
     @staticmethod
+    def _normalization_factors(factors: Tensor) -> tuple[Tensor, torch.dtype, float]:
+        output_dtype = factors.dtype
+        compute_dtype = (
+            torch.float32
+            if output_dtype in (torch.float16, torch.bfloat16)
+            else output_dtype
+        )
+        normalized_factors = factors.to(dtype=compute_dtype)
+        return normalized_factors, output_dtype, torch.finfo(compute_dtype).eps
+
+    @staticmethod
     def score_pairs(factors: Tensor, scales: Tensor, pairs: Tensor, eps: float) -> Tensor:
         pairs = pairs.to(device=factors.device, dtype=torch.long)
         i, j = pairs.unbind(dim=1)
-        u_i, u_j = factors[:, i], factors[:, j]
+        normalized_factors, output_dtype, normalization_eps = (
+            LowRankCorrelationHead._normalization_factors(factors)
+        )
+        u_i, u_j = normalized_factors[:, i], normalized_factors[:, j]
         rho = (u_i * u_j).sum(dim=-1)
-        rho = rho / (u_i.square().sum(dim=-1) * u_j.square().sum(dim=-1)).sqrt().clamp_min(eps)
+        rho = rho / (u_i.square().sum(dim=-1) * u_j.square().sum(dim=-1)).sqrt().clamp_min(normalization_eps)
         scale_ratio = LowRankCorrelationHead._scale_ratio(
             scales[:, i], scales[:, j], eps
         )
-        return rho * scale_ratio
+        return (rho * scale_ratio).to(dtype=output_dtype)
+
+    @staticmethod
+    def correlation(factors: Tensor) -> Tensor:
+        normalized_factors, output_dtype, eps = (
+            LowRankCorrelationHead._normalization_factors(factors)
+        )
+        gram = normalized_factors @ normalized_factors.transpose(1, 2)
+        diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+        rho = gram / (diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2)).sqrt().clamp_min(eps)
+        return rho.to(dtype=output_dtype)
 
     @staticmethod
     def materialize(factors: Tensor, scales: Tensor, eps: float) -> Tensor:
-        gram = factors @ factors.transpose(1, 2)
-        diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
-        rho = gram / (diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2)).sqrt().clamp_min(eps)
+        rho = LowRankCorrelationHead.correlation(factors)
         scale_ratio = LowRankCorrelationHead._scale_ratio(
             scales.unsqueeze(-1), scales.unsqueeze(-2), eps
         )
@@ -548,6 +570,14 @@ class AmortizedLK(nn.Module):
         return self.low_rank_h_head.materialize(
             factors, scales, torch.finfo(x.dtype).eps
         )
+
+    def predict_h_correlation(self, x: Tensor) -> Tensor:
+        """Predict the normalized correlation used by learned low-rank H."""
+        if self.h_method != "learned_low_rank":
+            raise ValueError("correlation prediction is available for learned_low_rank H only")
+        h, context, _, _ = self._features(x)
+        factors = self.low_rank_h_head.factors(h, context)
+        return self.low_rank_h_head.correlation(factors)
 
     def predict_covariance_ratio(
         self,

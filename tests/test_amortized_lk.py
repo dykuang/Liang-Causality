@@ -240,12 +240,13 @@ class AmortizedLKTests(unittest.TestCase):
         model = AmortizedLK(width=8, h_method="learned_low_rank", h_rank=3).double()
         graph, _, h_hat = model(self.x)
         self.assertEqual(tuple(h_hat.shape), (3, 4, 4))
-        rho = h_hat * torch.ones_like(h_hat)  # Recover rho with the known channel scales below.
         centered = self.x - self.x.mean(-1, keepdim=True)
         scales = centered.square().mean(-1).sqrt()
         anchor = centered.gather(-1, centered.abs().argmax(dim=-1, keepdim=True)).squeeze(-1)
         signed_scales = scales * torch.where(anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor))
-        rho = h_hat * signed_scales.unsqueeze(-2) / signed_scales.unsqueeze(-1)
+        recovered_rho = h_hat * signed_scales.unsqueeze(-2) / signed_scales.unsqueeze(-1)
+        rho = model.predict_h_correlation(self.x)
+        torch.testing.assert_close(rho, recovered_rho, atol=1e-10, rtol=1e-10)
         self.assertTrue(torch.allclose(rho, rho.transpose(-1, -2), atol=1e-10, rtol=1e-10))
         self.assertTrue(torch.allclose(torch.diagonal(rho, dim1=-2, dim2=-1), torch.ones(3, 4, dtype=self.x.dtype), atol=1e-10))
         pairs = torch.tensor([[0, 1], [2, 3], [1, 1]])
@@ -254,6 +255,30 @@ class AmortizedLKTests(unittest.TestCase):
         loss = sampled_covariance_ratio_pair_loss(self.x, selected, pairs)
         loss.backward()
         self.assertGreater(float(model.low_rank_h_head.network[0].weight.grad.norm()), 0.0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
+    def test_low_rank_correlation_structure_is_preserved_in_bfloat16(self):
+        model = AmortizedLK(
+            width=8, h_method="learned_low_rank", h_rank=3
+        ).cuda().to(dtype=torch.bfloat16).eval()
+        with torch.no_grad():
+            model.low_rank_h_head.network[-1].weight.mul_(1e-2)
+            model.low_rank_h_head.network[-1].bias.zero_()
+        x = self.x.cuda().to(dtype=torch.bfloat16)
+        pairs = torch.tensor([[0, 0], [1, 1], [2, 2]], device=x.device)
+
+        with torch.no_grad():
+            rho = model.predict_h_correlation(x)
+            h = model.predict_covariance_ratio(x)
+            selected = model.score_h_pairs(x, pairs)
+
+        rho_diagonal = torch.diagonal(rho, dim1=-2, dim2=-1)
+        h_diagonal = torch.diagonal(h, dim1=-2, dim2=-1)
+        self.assertLess(float((rho_diagonal - 1).abs().max()), 1e-3)
+        self.assertLess(float((h_diagonal - 1).abs().max()), 1e-3)
+        torch.testing.assert_close(
+            selected, h[:, pairs[:, 0], pairs[:, 1]], atol=1e-3, rtol=1e-3
+        )
 
     def test_exact_and_low_rank_h_preserve_scaling_and_permutation(self):
         scales = torch.tensor([0.02, -0.4, 3.0, 20.0], dtype=self.x.dtype)
