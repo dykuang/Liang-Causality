@@ -62,8 +62,15 @@ class ExactGraphTests(unittest.TestCase):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 x = self.x.cuda().to(dtype=dtype)
-                result = estimate_exact_graph(prepare_lk_statistics(x))
+                statistics = prepare_lk_statistics(x)
+                full_precision_statistics = prepare_lk_statistics(x.float())
+                result = estimate_exact_graph(statistics)
                 self.assertEqual(result.effective_dtype, torch.float32)
+                self.assertEqual(statistics.state.dtype, torch.float32)
+                torch.testing.assert_close(statistics.state, full_precision_statistics.state)
+                torch.testing.assert_close(
+                    statistics.derivative, full_precision_statistics.derivative
+                )
                 self.assertEqual(result.graph.dtype, torch.float32)
                 self.assertEqual(result.coefficients.dtype, torch.float32)
                 self.assertEqual(result.covariance_ratio.dtype, torch.float32)

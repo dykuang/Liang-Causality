@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
-from lk_statistics import LKStatistics
+from lk_statistics import LKStatistics, _statistics_computation_tensor
 
 
 @dataclass(frozen=True, eq=False)
@@ -52,11 +52,10 @@ def estimate_exact_graph(statistics: LKStatistics) -> ExactGraphResult:
     if not state.is_floating_point():
         raise TypeError("LK statistics must use a floating-point dtype")
 
+    state = _statistics_computation_tensor(state)
+    derivative = _statistics_computation_tensor(derivative)
     effective_dtype = state.dtype
-    if effective_dtype in (torch.float16, torch.bfloat16):
-        effective_dtype = torch.float32
-        state = state.to(dtype=effective_dtype)
-        derivative = derivative.to(dtype=effective_dtype)
+    if effective_dtype != statistics.state.dtype:
         statistics = LKStatistics(
             state=state,
             derivative=derivative,

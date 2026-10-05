@@ -23,11 +23,9 @@ def exact_lk_graph(x: torch.Tensor, *, n_step: int = 1, dt: float = 1.0):
     """Compatibility adapter for the graph-only exact LK estimation seam.
 
     Keep the historical ``(graph, coefficients, covariance_ratio)`` tuple for
-    evaluation callers. CUDA half and bfloat16 windows are promoted before
-    preparation so all exact statistics and outputs use float32.
+    evaluation callers. Low-precision windows are promoted by shared
+    statistics preparation so exact statistics and outputs use float32.
     """
-    if x.device.type == "cuda" and x.dtype in (torch.float16, torch.bfloat16):
-        x = x.float()
     result = estimate_exact_graph(prepare_lk_statistics(x, n_step=n_step, dt=dt))
     return result.graph, result.coefficients, result.covariance_ratio
 

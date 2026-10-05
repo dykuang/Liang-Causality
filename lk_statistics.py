@@ -10,6 +10,13 @@ import torch
 from torch import Tensor
 
 
+def _statistics_computation_tensor(x: Tensor) -> Tensor:
+    """Promote low-precision values before LK statistics are computed."""
+    if x.dtype in (torch.float16, torch.bfloat16):
+        return x.to(dtype=torch.float32)
+    return x
+
+
 @dataclass(frozen=True, eq=False)
 class LKStatistics:
     """Prepared, centered LK state and derivative for a batch of windows.
@@ -65,6 +72,8 @@ def prepare_lk_statistics(
     if dt <= 0:
         raise ValueError("dt must be positive")
 
+    # Keep low-precision input values but center and differentiate in float32.
+    x = _statistics_computation_tensor(x)
     n_step = int(n_step)
     history = x[..., :-n_step]
     derivative = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
