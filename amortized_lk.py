@@ -386,24 +386,33 @@ class LowRankCorrelationHead(nn.Module):
         return self.network(torch.cat((h, context), dim=-1))
 
     @staticmethod
+    def _scale_ratio(numerator: Tensor, denominator: Tensor, eps: float) -> Tensor:
+        denominator = torch.where(
+            denominator.abs() < eps, denominator.new_full((), eps), denominator
+        )
+        return numerator / denominator
+
+    @staticmethod
     def score_pairs(factors: Tensor, scales: Tensor, pairs: Tensor, eps: float) -> Tensor:
         pairs = pairs.to(device=factors.device, dtype=torch.long)
         i, j = pairs.unbind(dim=1)
         u_i, u_j = factors[:, i], factors[:, j]
         rho = (u_i * u_j).sum(dim=-1)
         rho = rho / (u_i.square().sum(dim=-1) * u_j.square().sum(dim=-1)).sqrt().clamp_min(eps)
-        denominator = scales[:, j]
-        denominator = torch.where(denominator.abs() < eps, denominator.new_full((), eps), denominator)
-        return rho * scales[:, i] / denominator
+        scale_ratio = LowRankCorrelationHead._scale_ratio(
+            scales[:, i], scales[:, j], eps
+        )
+        return rho * scale_ratio
 
     @staticmethod
     def materialize(factors: Tensor, scales: Tensor, eps: float) -> Tensor:
         gram = factors @ factors.transpose(1, 2)
         diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
         rho = gram / (diagonal.unsqueeze(-1) * diagonal.unsqueeze(-2)).sqrt().clamp_min(eps)
-        denominator = scales.unsqueeze(-2)
-        denominator = torch.where(denominator.abs() < eps, denominator.new_full((), eps), denominator)
-        return rho * scales.unsqueeze(-1) / denominator
+        scale_ratio = LowRankCorrelationHead._scale_ratio(
+            scales.unsqueeze(-1), scales.unsqueeze(-2), eps
+        )
+        return rho * scale_ratio
 
 
 def _make_encoder(encoder_type: str, width: int) -> nn.Module:
