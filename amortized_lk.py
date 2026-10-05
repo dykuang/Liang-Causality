@@ -25,7 +25,12 @@ LKInput = Tensor | LKStatistics
 
 
 def _as_lk_statistics(x: LKInput, n_step: int, dt: float) -> LKStatistics:
-    """Use prepared statistics directly or prepare them from a raw window."""
+    """Reuse prepared statistics or prepare a raw window.
+
+    ``n_step`` and ``dt`` apply only when ``x`` is a raw window. An
+    ``LKStatistics`` input is reused as-is and retains its own ``n_step`` and
+    ``dt``.
+    """
     if isinstance(x, LKStatistics):
         return x
     return prepare_lk_statistics(x, n_step=n_step, dt=dt)
@@ -34,7 +39,12 @@ def _as_lk_statistics(x: LKInput, n_step: int, dt: float) -> LKStatistics:
 def _state_and_derivative(
     x: LKInput, n_step: int, dt: float
 ) -> tuple[Tensor, Tensor]:
-    """Return centered state and finite-difference matrices as ``[B,p,m]``."""
+    """Return centered state and differences as ``[B,p,m]``.
+
+    ``n_step`` and ``dt`` configure preparation for a raw window. If ``x`` is
+    an ``LKStatistics`` input, its prepared state and derivative are reused
+    unchanged with its own ``n_step`` and ``dt``.
+    """
     statistics = _as_lk_statistics(x, n_step, dt)
     return statistics.state, statistics.derivative
 
@@ -64,6 +74,10 @@ def stochastic_probe_residual_loss(
 
     ``C`` and ``D`` are never materialized. The only data-dependent matrix
     products are with the window-shaped state and derivative arrays.
+
+    ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
+    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    ``dt``.
     """
     if q < 1:
         raise ValueError("q must be at least 1")
@@ -140,6 +154,10 @@ def random_projection_covariance_ratio(
     Supply a fixed ``[rank, time-n_step]`` projection to make inference
     deterministic for repeated windows of the same length. Otherwise a fresh
     Gaussian projection is drawn on each call. The output is ``[B,p,p]``.
+
+    ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
+    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    ``dt``.
     """
     if rank < 1:
         raise ValueError("rank must be at least 1")
@@ -164,7 +182,12 @@ def random_projection_covariance_ratio(
 def exact_covariance_ratio(
     x: LKInput, *, n_step: int = 1, dt: float = 1.0, eps: Optional[float] = None
 ) -> Tensor:
-    """Compute the exact sample ``H`` ratio for evaluation-only H0 baselines."""
+    """Compute the exact sample ``H`` ratio for evaluation-only H0 baselines.
+
+    ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
+    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    ``dt``.
+    """
     statistics = _as_lk_statistics(x, n_step, dt)
     # Exact H only needs state covariance. Leave cross-covariance lazy.
     gram = statistics.covariance * (statistics.state.shape[-1] - 1)
@@ -178,7 +201,12 @@ def sampled_covariance_ratio_loss(
     x: LKInput, h_hat: Tensor, pairs: Tensor, *, n_step: int = 1,
     dt: float = 1.0, eps: Optional[float] = None,
 ) -> Tensor:
-    """Supervise selected H[i,j] ratios directly, without an LK label or full H."""
+    """Supervise selected H[i,j] ratios without an LK label or full H.
+
+    ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
+    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    ``dt``.
+    """
     z, _ = _state_and_derivative(x, n_step, dt)
     batch, variables, _ = z.shape
     if pairs.ndim != 2 or pairs.shape[1] != 2:
@@ -200,7 +228,12 @@ def sampled_covariance_ratio_pair_loss(
     x: LKInput, h_pairs: Tensor, pairs: Tensor, *, n_step: int = 1,
     dt: float = 1.0, eps: Optional[float] = None,
 ) -> Tensor:
-    """Supervise selected covariance ratios without materializing full H."""
+    """Supervise selected covariance ratios without materializing full H.
+
+    ``n_step`` and ``dt`` configure preparation when ``x`` is a raw window.
+    An ``LKStatistics`` input is reused as-is with its own ``n_step`` and
+    ``dt``.
+    """
     z, _ = _state_and_derivative(x, n_step, dt)
     if pairs.ndim != 2 or pairs.shape[1] != 2:
         raise ValueError("pairs must have shape [num_pairs, 2]")
