@@ -37,6 +37,8 @@ Performance Tips:
 #%%
 import numpy as np
 import torch
+from lk_exact import estimate_exact_graph
+from lk_statistics import prepare_lk_statistics
 
 
 def _variance_diag(C, X_slice, RR, bb, dt, N):
@@ -193,51 +195,40 @@ class LiangCausalityEstimator(torch.nn.Module):
 
     def forward(self, x):
         # x should be shape (batch, channels, time)
-        # Optimized: process all batches using vectorized operations
-        batch_size, nx, nt = x.shape
-        device = x.device
         n_step = self.n_step
         dt = self.dt
-        
-        # Vectorized computation across batch dimension
-        X_slice = x[:, :, :-n_step]  # (batch, nx, nt-n_step)
-        X_centered = X_slice - X_slice.mean(dim=2, keepdim=True)
-        
-        # Covariance matrix: (batch, nx, nx)
-        C = torch.bmm(X_centered, X_centered.transpose(1, 2)) / (nt - 1 - n_step)
-        
-        # Derivative
-        dX = (x[:, :, n_step:] - x[:, :, :-n_step]) / (n_step * dt)
-        dX_centered = dX - dX.mean(dim=2, keepdim=True)
-        dC = torch.bmm(X_centered, dX_centered.transpose(1, 2)) / (nt - 1 - n_step)
-        
-        # Solve for T_pre using batch operations
-        try:
-            T_pre = torch.linalg.solve(C, dC)
-        except:
-            T_pre = torch.bmm(torch.linalg.pinv(C), dC)
-        
-        C_diag_vals = 1.0 / torch.diagonal(C, dim1=1, dim2=2)
-        C_diag = torch.diag_embed(C_diag_vals)
-        cM = torch.bmm(C, C_diag) * T_pre
-        
-        # Calculate residuals
-        ff = dX.mean(dim=2) - torch.bmm(X_slice.mean(dim=2).unsqueeze(1), T_pre).squeeze(1)
-        RR = dX - ff.unsqueeze(2) - torch.bmm(T_pre.transpose(1, 2), X_slice)
-        
+
+        statistics = prepare_lk_statistics(x, n_step=n_step, dt=dt)
+        nt = x.shape[-1]
+        graph_result = estimate_exact_graph(statistics)
+        C = statistics.covariance
+        T_pre = graph_result.coefficients
+        cM = graph_result.graph
+
+        # Centering removes the fitted intercept from the residual expression.
+        # This is algebraically equivalent to fitting ``ff`` against the raw
+        # history, while reusing the shared prepared state and derivative.
+        RR = statistics.derivative - torch.bmm(
+            T_pre.transpose(1, 2), statistics.state
+        )
+
         QQ = torch.sum(RR**2, dim=-1)
         bb = torch.sqrt(QQ * dt / (nt - n_step))
         dH_noise = bb**2 / 2 / torch.diagonal(C, dim1=1, dim2=2)
-        
+
         # Normalization
         ZZ = torch.sum(torch.abs(cM), dim=1, keepdim=True) + torch.abs(dH_noise.unsqueeze(1))
         cM_Z = cM / ZZ
-        
+
         # Variance estimation via the Fisher information matrix (Schur/Woodbury
         # form, see _variance_diag): one nx-by-nx inverse per batch item plus
         # closed-form 2x2 inverses, instead of allocating/inverting a
         # (batch, nx, nx+2, nx+2) tensor.
         N = nt - 1
+        # Preserve the raw history used by the existing variance formula. The
+        # shared statistics preparer promotes half and bfloat16 inputs to the
+        # dtype required by dense linear algebra.
+        X_slice = x[:, :, :-n_step].to(dtype=statistics.state.dtype)
         var = _variance_diag(C, X_slice, RR, bb, dt, N)
 
         return cM, var.transpose(1, 2), cM_Z
