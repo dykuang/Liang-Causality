@@ -63,25 +63,28 @@ class LKStatisticsTests(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is not available")
     def test_cpu_and_cuda_statistics_agree(self):
-        generator = torch.Generator().manual_seed(19)
-        x = torch.randn(2, 3, 24, dtype=torch.float64, generator=generator)
-
-        cpu = prepare_lk_statistics(x, n_step=3, dt=0.25)
-        cuda = prepare_lk_statistics(x.cuda(), n_step=3, dt=0.25)
-
-        for property_name in (
-            "state",
-            "derivative",
-            "covariance",
-            "cross_covariance",
-            "covariance_ratio",
+        for dtype, tolerance in (
+            (torch.float32, 1e-5),
+            (torch.float64, 1e-11),
         ):
-            torch.testing.assert_close(
-                getattr(cuda, property_name).cpu(),
-                getattr(cpu, property_name),
-                atol=1e-11,
-                rtol=1e-11,
-            )
+            generator = torch.Generator().manual_seed(19)
+            x = torch.randn(2, 3, 24, dtype=dtype, generator=generator)
+            cpu = prepare_lk_statistics(x, n_step=3, dt=0.25)
+            cuda = prepare_lk_statistics(x.cuda(), n_step=3, dt=0.25)
+
+            for property_name in (
+                "state",
+                "derivative",
+                "covariance",
+                "cross_covariance",
+                "covariance_ratio",
+            ):
+                torch.testing.assert_close(
+                    getattr(cuda, property_name).cpu(),
+                    getattr(cpu, property_name),
+                    atol=tolerance,
+                    rtol=tolerance,
+                )
 
 
 if __name__ == "__main__":

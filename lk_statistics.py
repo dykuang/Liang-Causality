@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import cached_property
 from numbers import Integral
 
 import torch
@@ -22,45 +23,30 @@ class LKStatistics:
     derivative: Tensor
     n_step: int
     dt: float
-    _cache: dict[str, Tensor] = field(
-        default_factory=dict, init=False, repr=False, compare=False
-    )
 
-    @property
+    @cached_property
     def covariance(self) -> Tensor:
         """Sample covariance of the centered state, shaped ``[B, p, p]``."""
-        value = self._cache.get("covariance")
-        if value is None:
-            value = torch.matmul(
-                self.state, self.state.transpose(-1, -2)
-            ) / (self.state.shape[-1] - 1)
-            self._cache["covariance"] = value
-        return value
+        return torch.matmul(
+            self.state, self.state.transpose(-1, -2)
+        ) / (self.state.shape[-1] - 1)
 
-    @property
+    @cached_property
     def cross_covariance(self) -> Tensor:
         """State/derivative cross-covariance, shaped ``[B, p, p]``."""
-        value = self._cache.get("cross_covariance")
-        if value is None:
-            value = torch.matmul(
-                self.state, self.derivative.transpose(-1, -2)
-            ) / (self.state.shape[-1] - 1)
-            self._cache["cross_covariance"] = value
-        return value
+        return torch.matmul(
+            self.state, self.derivative.transpose(-1, -2)
+        ) / (self.state.shape[-1] - 1)
 
-    @property
+    @cached_property
     def covariance_ratio(self) -> Tensor:
         """Return ``H[i,j] = Cov(i,j) / Var(j)`` without cross-covariance."""
-        value = self._cache.get("covariance_ratio")
-        if value is None:
-            # Scale back to the state Gram matrix to match the existing Torch
-            # exact-H stabilization, which clamps its diagonal at dtype eps.
-            gram = self.covariance * (self.state.shape[-1] - 1)
-            diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
-            eps = torch.finfo(gram.dtype).eps
-            value = gram / diagonal.unsqueeze(-2).clamp_min(eps)
-            self._cache["covariance_ratio"] = value
-        return value
+        # Scale back to the state Gram matrix to match the existing Torch
+        # exact-H stabilization, which clamps its diagonal at dtype eps.
+        gram = self.covariance * (self.state.shape[-1] - 1)
+        diagonal = torch.diagonal(gram, dim1=-2, dim2=-1)
+        eps = torch.finfo(gram.dtype).eps
+        return gram / diagonal.unsqueeze(-2).clamp_min(eps)
 
 
 def prepare_lk_statistics(
