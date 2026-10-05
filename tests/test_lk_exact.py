@@ -91,23 +91,6 @@ class ExactGraphTests(unittest.TestCase):
         torch.testing.assert_close(result.coefficients[0], expected_regular)
         torch.testing.assert_close(result.coefficients[1], expected_singular)
 
-    def test_direct_solve_fallback_is_limited_to_failed_windows(self):
-        x = self.x[:2].clone()
-        x[1, 3] = 2 * x[1, 0]
-        statistics = prepare_lk_statistics(x)
-        expected = torch.linalg.pinv(
-            statistics.covariance[1]
-        ) @ statistics.cross_covariance[1]
-
-        with patch("torch.linalg.solve", return_value=expected.unsqueeze(0)) as solve:
-            result = estimate_exact_graph(
-                statistics, singular_fallback="solve"
-            )
-
-        self.assertEqual(solve.call_count, 1)
-        self.assertEqual(tuple(solve.call_args.args[0].shape), (1, 4, 4))
-        torch.testing.assert_close(result.coefficients[1], expected)
-
     def test_evaluation_helper_remains_a_tuple_adapter(self):
         result = estimate_exact_graph(prepare_lk_statistics(self.x))
         graph, coefficients, ratio = exact_lk_graph(self.x)

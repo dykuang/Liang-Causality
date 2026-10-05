@@ -46,11 +46,9 @@ def _timing(fn, repeats: int, warmup: int, device: torch.device) -> tuple[float,
 
 
 def _exact_graph_solve_ex(x: torch.Tensor, n_step: int = 1, dt: float = 1.0) -> torch.Tensor:
-    """Benchmark the shared exact kernel with a direct-solve fallback."""
+    """Benchmark the shared solve_ex kernel with per-window pinv fallback."""
     statistics = prepare_lk_statistics(x, n_step=n_step, dt=dt)
-    return estimate_exact_graph(
-        statistics, singular_fallback="solve"
-    ).graph
+    return estimate_exact_graph(statistics).graph
 
 
 def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:

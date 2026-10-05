@@ -265,13 +265,22 @@ class BenchmarkResultTests(unittest.TestCase):
                 ],
             )
 
+    def test_solve_ex_benchmark_uses_pseudoinverse_for_singular_windows(self):
+        x = torch.randn(2, 4, 32, dtype=torch.float64)
+        x[1, 3] = 2 * x[1, 0]
+        statistics = prepare_lk_statistics(x)
+
+        actual = _exact_graph_solve_ex(x)
+        expected = estimate_exact_graph(statistics).graph
+
+        torch.testing.assert_close(actual, expected)
+        self.assertTrue(torch.isfinite(actual).all())
+
     def test_solve_ex_benchmark_uses_shared_exact_graph_kernel(self):
         x = torch.randn(2, 4, 32, dtype=torch.float64)
         statistics = prepare_lk_statistics(x, n_step=2, dt=0.5)
 
-        expected = estimate_exact_graph(
-            statistics, singular_fallback="solve"
-        ).graph
+        expected = estimate_exact_graph(statistics).graph
         actual = _exact_graph_solve_ex(x, n_step=2, dt=0.5)
 
         torch.testing.assert_close(actual, expected)
