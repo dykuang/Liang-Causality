@@ -265,17 +265,28 @@ class AmortizedLKTests(unittest.TestCase):
             model.low_rank_h_head.network[-1].weight.mul_(1e-2)
             model.low_rank_h_head.network[-1].bias.zero_()
         x = self.x.cuda().to(dtype=torch.bfloat16)
+        channel_scales = torch.tensor(
+            [0.001, 0.002, 0.004, 0.006], device=x.device, dtype=x.dtype
+        )
+        scaled_x = x * channel_scales[None, :, None]
         pairs = torch.tensor([[0, 0], [1, 1], [2, 2]], device=x.device)
 
         with torch.no_grad():
             rho = model.predict_h_correlation(x)
             h = model.predict_covariance_ratio(x)
+            scaled_h = model.predict_covariance_ratio(scaled_x)
             selected = model.score_h_pairs(x, pairs)
 
         rho_diagonal = torch.diagonal(rho, dim1=-2, dim2=-1)
         h_diagonal = torch.diagonal(h, dim1=-2, dim2=-1)
         self.assertLess(float((rho_diagonal - 1).abs().max()), 1e-3)
         self.assertLess(float((h_diagonal - 1).abs().max()), 1e-3)
+        expected_scaled_h = (
+            h * channel_scales.view(1, -1, 1) / channel_scales.view(1, 1, -1)
+        )
+        torch.testing.assert_close(
+            scaled_h, expected_scaled_h, atol=2e-3, rtol=2e-2
+        )
         torch.testing.assert_close(
             selected, h[:, pairs[:, 0], pairs[:, 1]], atol=1e-3, rtol=1e-3
         )

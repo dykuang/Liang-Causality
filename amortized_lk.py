@@ -24,6 +24,14 @@ from lk_statistics import LKSufficientStatistics, prepare_lk_statistics
 LKInput = Tensor | LKSufficientStatistics
 
 
+def _normalization_dtype(dtype: torch.dtype) -> torch.dtype:
+    return torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+
+
+def _normalization_epsilon(dtype: torch.dtype) -> float:
+    return torch.finfo(_normalization_dtype(dtype)).eps
+
+
 def _as_lk_sufficient_statistics(
     x: LKInput, n_step: int, dt: float
 ) -> LKSufficientStatistics:
@@ -395,11 +403,7 @@ class LowRankCorrelationHead(nn.Module):
     @staticmethod
     def _normalization_factors(factors: Tensor) -> tuple[Tensor, torch.dtype, float]:
         output_dtype = factors.dtype
-        compute_dtype = (
-            torch.float32
-            if output_dtype in (torch.float16, torch.bfloat16)
-            else output_dtype
-        )
+        compute_dtype = _normalization_dtype(output_dtype)
         normalized_factors = factors.to(dtype=compute_dtype)
         return normalized_factors, output_dtype, torch.finfo(compute_dtype).eps
 
@@ -502,13 +506,20 @@ class AmortizedLK(nn.Module):
     def _features(self, x: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if x.ndim != 3:
             raise ValueError("x must have shape [batch, variables, time]")
-        centered = x - x.mean(dim=-1, keepdim=True)
-        rms = centered.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(torch.finfo(x.dtype).eps)
+        compute_dtype = _normalization_dtype(x.dtype)
+        normalization_input = x.to(dtype=compute_dtype)
+        centered = normalization_input - normalization_input.mean(dim=-1, keepdim=True)
+        rms = centered.square().mean(dim=-1, keepdim=True).sqrt().clamp_min(
+            torch.finfo(compute_dtype).eps
+        )
         anchor = centered.gather(-1, centered.abs().argmax(dim=-1, keepdim=True))
-        signed_scales = rms * torch.where(anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor))
-        h = self.encoder(centered / signed_scales)
+        signed_scales = rms * torch.where(
+            anchor < 0, -torch.ones_like(anchor), torch.ones_like(anchor)
+        )
+        normalized = (centered / signed_scales).to(dtype=x.dtype)
+        h = self.encoder(normalized)
         context = self.global_rho(self.global_phi(h).mean(dim=1)) if self.use_global_context else torch.zeros_like(h.mean(dim=1))
-        return h, context, signed_scales.squeeze(-1), centered
+        return h, context, signed_scales.squeeze(-1).to(dtype=x.dtype), centered
 
     def _pair_features(
         self, h: Tensor, context: Tensor,
@@ -568,7 +579,7 @@ class AmortizedLK(nn.Module):
             return self.h_decoder(pair_features).squeeze(-1)
         factors = self.low_rank_h_head.factors(h, context)
         return self.low_rank_h_head.materialize(
-            factors, scales, torch.finfo(x.dtype).eps
+            factors, scales, _normalization_epsilon(x.dtype)
         )
 
     def predict_h_correlation(self, x: Tensor) -> Tensor:
@@ -597,7 +608,9 @@ class AmortizedLK(nn.Module):
             raise ValueError("selected-pair scoring is available for learned_low_rank H only")
         h, context, scales, _ = self._features(x)
         factors = self.low_rank_h_head.factors(h, context)
-        return self.low_rank_h_head.score_pairs(factors, scales, pairs, torch.finfo(x.dtype).eps)
+        return self.low_rank_h_head.score_pairs(
+            factors, scales, pairs, _normalization_epsilon(x.dtype)
+        )
 
     def forward(self, x: Tensor, *, projection: Optional[Tensor] = None,
                 generator: Optional[torch.Generator] = None, compute_graph: bool = True
