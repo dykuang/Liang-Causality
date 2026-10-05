@@ -7,8 +7,11 @@ variants:
   - {name: exact_graph_only, mode: exact_graph}
   - {name: exact_h, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: exact}
   - {name: proj_h8, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: projection, projection_rank: 8}
+  - {name: proj_h16, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: projection, projection_rank: 16}
   - {name: proj_h32, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: projection, projection_rank: 32}
+  - {name: proj_h64, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: projection, projection_rank: 64}
   - {name: pair_h, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_pair}
   - {name: lr_h4, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_low_rank, h_rank: 4}
   - {name: lr_h8, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_low_rank, h_rank: 8}
   - {name: lr_h16, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_low_rank, h_rank: 16}
+  - {name: lr_h32, mode: amortized, encoder_type: downsample_mlp, decoder_type: low_rank, low_rank: 16, h_method: learned_low_rank, h_rank: 32}

@@ -6,8 +6,12 @@ from pathlib import Path
 import torch
 import yaml
 
+from lk_exact import estimate_exact_graph
+from lk_statistics import prepare_lk_statistics
+
 from benchmark_lk_ablations import (
     _example_batch,
+    _exact_graph_solve_ex,
     _h_metrics,
     result_precision_metadata,
     run,
@@ -260,6 +264,17 @@ class BenchmarkResultTests(unittest.TestCase):
                     for row in first_rows
                 ],
             )
+
+    def test_solve_ex_benchmark_uses_shared_exact_graph_kernel(self):
+        x = torch.randn(2, 4, 32, dtype=torch.float64)
+        statistics = prepare_lk_statistics(x, n_step=2, dt=0.5)
+
+        expected = estimate_exact_graph(
+            statistics, singular_fallback="solve"
+        ).graph
+        actual = _exact_graph_solve_ex(x, n_step=2, dt=0.5)
+
+        torch.testing.assert_close(actual, expected)
 
 
 if __name__ == "__main__":

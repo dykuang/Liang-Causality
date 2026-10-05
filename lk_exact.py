@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -24,18 +25,24 @@ class ExactGraphResult:
     effective_dtype: torch.dtype
 
 
-def estimate_exact_graph(statistics: LKSufficientStatistics) -> ExactGraphResult:
+def estimate_exact_graph(
+    statistics: LKSufficientStatistics,
+    *,
+    singular_fallback: Literal["pinv", "solve"] = "pinv",
+) -> ExactGraphResult:
     """Estimate the exact LK graph from prepared sufficient statistics.
 
     The coefficient matrix is ``solve(C, D)`` and the graph is the
     elementwise product of that matrix with the covariance ratio. A batched
-    ``solve_ex`` attempts every window independently; only windows with a
-    nonzero status use a pseudoinverse fallback. This keeps one singular
-    covariance from interrupting well-conditioned windows in the batch.
+    ``solve_ex`` attempts every window independently; windows with a nonzero
+    status use the selected fallback. The default ``pinv`` fallback keeps one
+    singular covariance from interrupting well-conditioned windows in the batch.
 
     Half and bfloat16 statistics are promoted to float32 before dense
     statistics are materialized. The result reports that effective dtype.
     """
+    if singular_fallback not in {"pinv", "solve"}:
+        raise ValueError("singular_fallback must be 'pinv' or 'solve'")
     if not isinstance(statistics, LKSufficientStatistics):
         raise TypeError("statistics must be an LKSufficientStatistics value")
 
@@ -72,7 +79,12 @@ def estimate_exact_graph(statistics: LKSufficientStatistics) -> ExactGraphResult
     )
     failed = info != 0
     if failed.any():
-        fallback = torch.linalg.pinv(covariance[failed]) @ cross_covariance[failed]
+        if singular_fallback == "pinv":
+            fallback = torch.linalg.pinv(covariance[failed]) @ cross_covariance[failed]
+        else:
+            fallback = torch.linalg.solve(
+                covariance[failed], cross_covariance[failed]
+            )
         coefficients = coefficients.clone()
         coefficients[failed] = fallback
 

@@ -19,6 +19,8 @@ except ImportError as exc:
 from amortized_lk import AmortizedLK, exact_covariance_ratio
 from evaluate_amortized_lk import exact_lk_graph
 from lk_estimators import LKEstimator
+from lk_exact import estimate_exact_graph
+from lk_statistics import prepare_lk_statistics
 from train_amortized_lk import stable_var_batch, train_amortized_step
 
 
@@ -44,16 +46,11 @@ def _timing(fn, repeats: int, warmup: int, device: torch.device) -> tuple[float,
 
 
 def _exact_graph_solve_ex(x: torch.Tensor, n_step: int = 1, dt: float = 1.0) -> torch.Tensor:
-    z = x[..., :-n_step]
-    y = (x[..., n_step:] - x[..., :-n_step]) / (n_step * dt)
-    z, y = z - z.mean(-1, keepdim=True), y - y.mean(-1, keepdim=True)
-    denom = z.shape[-1] - 1
-    c, d = z @ z.transpose(1, 2) / denom, z @ y.transpose(1, 2) / denom
-    w, info = torch.linalg.solve_ex(c, d, check_errors=False)
-    if torch.any(info != 0):
-        w = torch.linalg.solve(c, d)
-    h = c / torch.diagonal(c, dim1=-2, dim2=-1).unsqueeze(-2).clamp_min(torch.finfo(x.dtype).eps)
-    return h * w
+    """Benchmark the shared exact kernel with a direct-solve fallback."""
+    statistics = prepare_lk_statistics(x, n_step=n_step, dt=dt)
+    return estimate_exact_graph(
+        statistics, singular_fallback="solve"
+    ).graph
 
 
 def _rank_corr(a: torch.Tensor, b: torch.Tensor) -> float:
